@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import { readFile, writeFile, unlink } from "fs/promises";
@@ -13,6 +14,26 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
+
+const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "https://creolab.kz",
+  "https://www.creolab.kz",
+  "https://site.creolab.kz",
+];
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(null, false);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+  }),
+);
 app.use(express.json({ type: "application/json" }));
 
 const PORT = process.env.PORT || 3000;
@@ -37,6 +58,72 @@ function validateEnv() {
     return "OPENAI_MODEL не задан. Скопируйте .env.example в .env и укажите доступную модель OpenAI.";
   }
   return null;
+}
+
+function cleanText(value, maxLength) {
+  if (value === undefined || value === null) return "";
+  return String(value).trim().slice(0, maxLength);
+}
+
+function formatAlmatyDateTime(date = new Date()) {
+  return new Intl.DateTimeFormat("ru-RU", {
+    timeZone: "Asia/Almaty",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+async function sendTelegramMessage(message) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!token) {
+    throw new Error("TELEGRAM_BOT_TOKEN is not configured");
+  }
+  if (!chatId) {
+    throw new Error("TELEGRAM_CHAT_ID is not configured");
+  }
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${token}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+      }),
+    },
+  );
+
+  const data = await response.json().catch(() => null);
+
+  if (!response.ok || !data?.ok) {
+    console.error("Telegram API error:", data || `HTTP ${response.status}`);
+    throw new Error("Telegram API request failed");
+  }
+
+  return data;
+}
+
+function buildLeadTelegramMessage({ name, phone, service, comment, pageUrl }) {
+  return [
+    "🟢 Новая заявка с сайта CREOLAB",
+    "",
+    `Имя: ${name}`,
+    `Телефон: ${phone}`,
+    `Услуга: ${service || "—"}`,
+    `Комментарий: ${comment || "—"}`,
+    "",
+    `Страница: ${pageUrl || "—"}`,
+    `Время: ${formatAlmatyDateTime()}`,
+  ].join("\n");
 }
 
 async function loadPromptFiles() {
@@ -101,6 +188,49 @@ app.get("/", (_req, res) => {
     status: "ok",
     message: "CREOLAB WhatsApp AI Sales Manager is running",
   });
+});
+
+app.post("/api/lead", async (req, res) => {
+  try {
+    const website = cleanText(req.body?.website, 200);
+    if (website) {
+      return res.json({ success: true });
+    }
+
+    const name = cleanText(req.body?.name, 120);
+    const phone = cleanText(req.body?.phone, 40);
+    const service = cleanText(req.body?.service, 200);
+    const comment = cleanText(req.body?.comment, 1000);
+    const pageUrl = cleanText(req.body?.pageUrl, 500);
+
+    if (!name || !phone) {
+      return res.status(400).json({
+        success: false,
+        message: "Укажите имя и номер телефона",
+      });
+    }
+
+    const message = buildLeadTelegramMessage({
+      name,
+      phone,
+      service,
+      comment,
+      pageUrl,
+    });
+
+    await sendTelegramMessage(message);
+
+    return res.json({
+      success: true,
+      message: "Заявка успешно отправлена",
+    });
+  } catch (error) {
+    console.error("LEAD TELEGRAM ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Не удалось отправить заявку",
+    });
+  }
 });
 
 app.post("/test-ai", async (req, res) => {
