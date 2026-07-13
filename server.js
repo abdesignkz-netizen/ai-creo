@@ -17,10 +17,12 @@ const app = express();
 
 const ALLOWED_ORIGINS = [
   "http://localhost:5173",
+  "http://localhost:5176",
   "https://creolab.kz",
   "https://www.creolab.kz",
-  "https://site.creolab.kz",
-];
+  "https://site.creolab.kz", // Netlify / кастомный домен — при смене URL обновите или задайте FRONTEND_ORIGIN
+  process.env.FRONTEND_ORIGIN,
+].filter(Boolean);
 
 app.use(
   cors({
@@ -113,17 +115,21 @@ async function sendTelegramMessage(message) {
 }
 
 function buildLeadTelegramMessage({ name, phone, service, comment, pageUrl }) {
-  return [
+  const lines = [
     "🟢 Новая заявка с сайта CREOLAB",
     "",
     `Имя: ${name}`,
     `Телефон: ${phone}`,
-    `Услуга: ${service || "—"}`,
-    `Комментарий: ${comment || "—"}`,
-    "",
-    `Страница: ${pageUrl || "—"}`,
-    `Время: ${formatAlmatyDateTime()}`,
-  ].join("\n");
+  ];
+
+  if (service) lines.push(`Услуга: ${service}`);
+  if (comment) lines.push(`Комментарий: ${comment}`);
+
+  lines.push("");
+  if (pageUrl) lines.push(`Страница: ${pageUrl}`);
+  lines.push(`Время: ${formatAlmatyDateTime()}`);
+
+  return lines.join("\n");
 }
 
 async function loadPromptFiles() {
