@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import multer from "multer";
 import OpenAI from "openai";
 import { readFile, writeFile, unlink } from "fs/promises";
 import { createReadStream } from "fs";
@@ -18,11 +19,20 @@ const app = express();
 const ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "http://localhost:5176",
+  "http://localhost:4173",
   "https://creolab.kz",
   "https://www.creolab.kz",
   "https://site.creolab.kz", // Netlify / кастомный домен — при смене URL обновите или задайте FRONTEND_ORIGIN
   process.env.FRONTEND_ORIGIN,
 ].filter(Boolean);
+
+const leadUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 8,
+    fileSize: 12 * 1024 * 1024,
+  },
+});
 
 app.use(
   cors({
@@ -36,7 +46,8 @@ app.use(
     methods: ["GET", "POST", "OPTIONS"],
   }),
 );
-app.use(express.json({ type: "application/json" }));
+app.use(express.json({ type: "application/json", limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const sessions = new Map();
@@ -79,7 +90,7 @@ function formatAlmatyDateTime(date = new Date()) {
   }).format(date);
 }
 
-async function sendTelegramMessage(message) {
+function getTelegramCredentials() {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
@@ -89,6 +100,12 @@ async function sendTelegramMessage(message) {
   if (!chatId) {
     throw new Error("TELEGRAM_CHAT_ID is not configured");
   }
+
+  return { token, chatId };
+}
+
+async function sendTelegramMessage(message) {
+  const { token, chatId } = getTelegramCredentials();
 
   const response = await fetch(
     `https://api.telegram.org/bot${token}/sendMessage`,
@@ -114,22 +131,69 @@ async function sendTelegramMessage(message) {
   return data;
 }
 
-function buildLeadTelegramMessage({ name, phone, service, comment, pageUrl }) {
+async function sendTelegramDocument(file, caption = "") {
+  const { token, chatId } = getTelegramCredentials();
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (caption) form.append("caption", caption.slice(0, 900));
+  form.append(
+    "document",
+    new Blob([file.buffer], { type: file.mimetype || "application/octet-stream" }),
+    file.originalname || "file",
+  );
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${token}/sendDocument`,
+    {
+      method: "POST",
+      body: form,
+    },
+  );
+
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.ok) {
+    console.error("Telegram sendDocument error:", data || `HTTP ${response.status}`);
+    throw new Error("Telegram document upload failed");
+  }
+  return data;
+}
+
+function buildLeadTelegramMessage({
+  name,
+  phone,
+  service,
+  comment,
+  pageUrl,
+  source,
+  presentationType,
+  deadline,
+  fileNames,
+}) {
+  const isPresentation =
+    source === "presentation" ||
+    /\/presentation/i.test(pageUrl || "") ||
+    /презентац/i.test(service || "");
+
   const lines = [
-    "🟢 Новая заявка с сайта CREOLAB",
+    isPresentation
+      ? "🟢 Новая заявка · Презентации CREOLAB"
+      : "🟢 Новая заявка с сайта CREOLAB",
     "",
     `Имя: ${name}`,
     `Телефон: ${phone}`,
   ];
 
   if (service) lines.push(`Услуга: ${service}`);
+  if (presentationType) lines.push(`Тип презентации: ${presentationType}`);
+  if (deadline) lines.push(`Срок: ${deadline}`);
   if (comment) lines.push(`Комментарий: ${comment}`);
+  if (fileNames?.length) lines.push(`Файлы: ${fileNames.join(", ")}`);
 
   lines.push("");
   if (pageUrl) lines.push(`Страница: ${pageUrl}`);
   lines.push(`Время: ${formatAlmatyDateTime()}`);
 
-  return lines.join("\n");
+  return lines.join("\n").slice(0, 4000);
 }
 
 async function loadPromptFiles() {
@@ -196,7 +260,7 @@ app.get("/", (_req, res) => {
   });
 });
 
-app.post("/api/lead", async (req, res) => {
+app.post("/api/lead", leadUpload.array("files", 8), async (req, res) => {
   try {
     const website = cleanText(req.body?.website, 200);
     if (website) {
@@ -206,8 +270,16 @@ app.post("/api/lead", async (req, res) => {
     const name = cleanText(req.body?.name, 120);
     const phone = cleanText(req.body?.phone, 40);
     const service = cleanText(req.body?.service, 200);
-    const comment = cleanText(req.body?.comment, 1000);
+    const comment = cleanText(req.body?.comment, 3500);
     const pageUrl = cleanText(req.body?.pageUrl, 500);
+    const source = cleanText(req.body?.source, 80);
+    const presentationType = cleanText(
+      req.body?.presentationType || req.body?.type,
+      120,
+    );
+    const deadline = cleanText(req.body?.deadline, 120);
+    const files = Array.isArray(req.files) ? req.files : [];
+    const fileNames = files.map((f) => f.originalname).filter(Boolean);
 
     if (!name || !phone) {
       return res.status(400).json({
@@ -222,9 +294,21 @@ app.post("/api/lead", async (req, res) => {
       service,
       comment,
       pageUrl,
+      source,
+      presentationType,
+      deadline,
+      fileNames,
     });
 
     await sendTelegramMessage(message);
+
+    for (const file of files) {
+      try {
+        await sendTelegramDocument(file, `${name} · ${phone}`);
+      } catch (fileError) {
+        console.error("LEAD FILE TELEGRAM ERROR:", fileError);
+      }
+    }
 
     return res.json({
       success: true,
