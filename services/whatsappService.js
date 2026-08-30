@@ -262,12 +262,12 @@ export async function checkWhatsAppNumber(phone) {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        chatId: `${normalized}@c.us`,
-        force: true,
+        phoneNumber: Number(normalized),
       }),
     });
 
     const data = await response.json().catch(() => null);
+    const raw = JSON.stringify(data || "");
     log("WHATSAPP CHECK", {
       phone: normalized,
       http: response.status,
@@ -280,8 +280,8 @@ export async function checkWhatsAppNumber(phone) {
     if (data?.existsWhatsapp === true) {
       return { exists: true };
     }
-    if (!response.ok || /bad phone|valid from 11 to 16/i.test(JSON.stringify(data || ""))) {
-      return { exists: false, reason: "Некорректный или недоступный номер WhatsApp" };
+    if (/bad phone number|valid from 11 to 16 digits/i.test(raw)) {
+      return { exists: false, reason: "Некорректный номер WhatsApp" };
     }
 
     return {

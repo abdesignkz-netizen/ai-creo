@@ -52,7 +52,15 @@ function parseByRules(message) {
     actions.push({ type: "LAST_SEND_STATUS", value: null, text: null });
   }
 
-  if (phone && /сюда|на этот номер|вот сюда/i.test(text)) {
+  const leftover = stripPhoneFromText(text).replace(/[!?.,]+/g, "").trim();
+  const leftoverTask = leftover
+    .replace(/на этот номер|на указанный номер|вот сюда|сюда|туда|отправь|перешли|направь/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (phone && leftover.length === 0) {
+    actions.push({ type: "SEND_HERE", value: phone, text: null });
+  } else if (phone && leftoverTask.length < 6 && /сюда|на этот номер|вот сюда/i.test(text)) {
     actions.push({ type: "SEND_HERE", value: phone, text: null });
   }
 
@@ -88,11 +96,6 @@ function parseByRules(message) {
     });
   }
 
-  const leftover = stripPhoneFromText(text).replace(/[!?.,]+/g, "").trim();
-  if (phone && leftover.length === 0) {
-    actions.push({ type: "SEND_HERE", value: phone, text: null });
-  }
-
   const fileHint = isFileSendCommand(text);
   if (fileHint) {
     actions.push({ type: "WAIT_FILE", value: phone, text: null });
@@ -104,7 +107,7 @@ function parseByRules(message) {
     /(скажи|объясни|предложи|уточни|узнай|напомин|нвпомин|напомани|попробуй|сделай акцент|отправь|закрой|доведи|подробност|заявк|напиши|свяжись|на этот номер|на указанный)/i.test(
       text,
     );
-  if (composeHint) {
+  if (composeHint && leftoverTask.length >= 6) {
     actions.push({
       type: "AI_COMPOSE",
       value: cleanComposeInstruction(text),
@@ -125,7 +128,10 @@ function rulesAreComplete(parsed) {
   if (types.has("LIST_LEADS") || types.has("LAST_SEND_STATUS")) {
     return true;
   }
-  if ((types.has("SEND_HERE") || types.has("WAIT_FILE")) && parsed.phone) {
+  if (types.has("WAIT_FILE") && parsed.phone && !types.has("AI_COMPOSE") && !types.has("EXACT_MESSAGE")) {
+    return true;
+  }
+  if (types.has("SEND_HERE") && parsed.phone && !types.has("AI_COMPOSE") && !types.has("EXACT_MESSAGE") && !types.has("ASK_CLIENT")) {
     return true;
   }
   if (types.has("STATUS_QUERY") && (parsed.phone || parsed.leadId)) {

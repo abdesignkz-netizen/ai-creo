@@ -204,8 +204,8 @@ async function sendToClient({ lead, text, phone, files = [] }) {
         sentIds.push(sent.idMessage);
       }
       await confirmOutgoingDelivery(sent?.idMessage, {
-        requireStatus: check.exists !== true,
-        timeoutMs: check.exists === true ? 1500 : 7000,
+        requireStatus: false,
+        timeoutMs: 2000,
       });
     }
     if (outgoingText) {
@@ -214,8 +214,8 @@ async function sendToClient({ lead, text, phone, files = [] }) {
         sentIds.push(sent.idMessage);
       }
       await confirmOutgoingDelivery(sent?.idMessage, {
-        requireStatus: check.exists !== true,
-        timeoutMs: check.exists === true ? 1500 : 7000,
+        requireStatus: false,
+        timeoutMs: 2000,
       });
     }
     if (!sentIds.length) {
@@ -545,7 +545,11 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
     return { ok: true, kind: "wait_file", phone };
   }
 
-  if (actions.some((item) => item.type === "SEND_HERE") && parsed.phone) {
+  if (
+    actions.some((item) => item.type === "SEND_HERE") &&
+    parsed.phone &&
+    !actions.some((item) => ["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"].includes(item.type))
+  ) {
     const draft = await getPendingOutbound();
     if (draft?.draft || draft?.files?.length) {
       await setPendingOutbound({
