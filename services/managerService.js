@@ -126,15 +126,27 @@ function describeFiles(files) {
   );
 }
 
+const SEND_FILE_COMMAND_RE =
+  /(отправь|перешли|направь|прикрепи)(\s+(этот|вот|это|данный))?(\s+(файл|фото|документ|пдф|картинку|картинка|вложение))?|(этот|вот|это|данный)\s+(файл|фото|документ|пдф|картинку|картинка|вложение)/gi;
+
+const FILE_DESTINATION_RE =
+  /на\s+(этот\s+|указанный\s+)?номер|по\s+(этому\s+)?номеру|этому\s+клиенту|клиенту|вот\s+сюда|(^|\s)(сюда|туда)(?=\s|$)/gi;
+
 function fileCaptionFromMessage(message) {
+  SEND_FILE_COMMAND_RE.lastIndex = 0;
+  FILE_DESTINATION_RE.lastIndex = 0;
   const cleaned = stripPhoneFromText(message)
-    .replace(
-      /^(отправь|перешли|направь)(\s+(этот|вот|это))?\s*(файл|фото|документ|пдф|картинку|картинка)?\s*/i,
-      "",
-    )
+    .replace(SEND_FILE_COMMAND_RE, " ")
+    .replace(FILE_DESTINATION_RE, " ")
+    .replace(/[!?.,:;]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  if (!cleaned || isConfirmSend(cleaned) || isCancelSend(cleaned)) {
+  if (
+    !cleaned ||
+    /^(этот|вот|это|файл|фото|документ|пдф|пожалуйста)$/i.test(cleaned) ||
+    isConfirmSend(cleaned) ||
+    isCancelSend(cleaned)
+  ) {
     return "";
   }
   return cleaned;
@@ -345,7 +357,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
     await setPendingOutbound({
       phone,
       draft: pending?.draft || "",
-      instruction: pending?.instruction || message,
+      instruction: pending?.instruction || "",
       fileCaption: caption,
       files,
     });
