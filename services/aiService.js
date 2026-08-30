@@ -216,27 +216,32 @@ export async function generateAiReply({
   return { reply, result, raw, latencyMs, nextHistory: updatedHistory };
 }
 
-export async function composeClientMessage({ lead, instruction }) {
+export async function composeClientMessage({ lead, instruction, extraContext = "" }) {
   const history = formatHistory(lead?.conversationHistory || []);
   const input = [
-    "Ты WhatsApp-менеджер CREOLAB.",
-    "Напиши одно сообщение КЛИЕНТУ, не менеджеру.",
-    "Это исходящее WhatsApp-сообщение: система отправит его на номер клиента сама.",
+    "Ты пишешь одно исходящее WhatsApp-сообщение клиенту CREOLAB.",
+    "Главное — выполни задачу менеджера по смыслу. Не подменяй её шаблоном.",
+    "Не пиши типовые фразы вроде «актуальна ли заявка», «готов ли обсудить шаги», «задайте пару вопросов», если менеджер просил о другом.",
+    "Если просят напомнить о согласовании, подтверждении, запуске, файле или макете — пиши именно об этом.",
+    "Опирайся на историю переписки и контекст, а не на общий сценарий продаж.",
+    "Не начинай мини-бриф и не предлагай услуги, если задача другая.",
+    "Пиши на «Вы», коротко, как живой менеджер.",
+    "Не упоминай менеджера, lead, команды и что текст составлен по инструкции.",
     "Не пиши, что не можешь отправить. Не проси скопировать текст.",
-    "Обращайся на «Вы», коротко, без канцелярита.",
-    "Не упоминай менеджера, lead и внутренние команды.",
-    "Не начинай сразу с цены, если этого не просит инструкция.",
-    "Если нужно уточнить заявку — задай мини-бриф клиенту по пунктам.",
+    extraContext ? `Контекст: ${extraContext}` : "",
+    `Имя клиента: ${unknown(lead?.clientName)}`,
+    `Услуга: ${unknown(lead?.service)}`,
+    `Последнее от клиента: ${unknown(lead?.lastClientMessage)}`,
     "",
-    buildDynamicLeadBlock(lead || {}, { extraInstruction: instruction }),
-    "",
-    "История:",
+    "История переписки:",
     history,
     "",
-    `Задача: ${instruction}`,
+    `Задача менеджера: ${instruction}`,
     "",
-    "Верни только текст сообщения клиенту, без JSON и кавычек.",
-  ].join("\n");
+    "Верни только текст сообщения клиенту, без кавычек и без пояснений.",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
 
   const response = await getOpenAIClient().responses.create({
     model: process.env.OPENAI_MODEL,
@@ -259,7 +264,8 @@ export async function parseManagerCommandWithAi(message) {
     "SET_MIN_PRICE, SET_GOAL, ADD_INSTRUCTION, SET_MODE, ASK_CLIENT,",
     "EXACT_MESSAGE, AI_COMPOSE, STATUS_QUERY, LIST_LEADS, TRANSFER_TO_HUMAN.",
     "SET_MODE value: AUTO | CONTROLLED | HUMAN | PAUSED.",
-    "Если менеджер просит узнать/предложить/напомнить/сделать акцент — это AI_COMPOSE или ASK_CLIENT.",
+    "Если менеджер просит узнать/предложить/напомнить/написать текст — это AI_COMPOSE, даже если в тексте есть слово «картинка» или «файл» как тема.",
+    "WAIT_FILE только если явно просят отправить вложение и не просят составить текст.",
     "Если есть «отправь:», «напиши дословно:», «передай дословно:» — EXACT_MESSAGE, text = точный текст после двоеточия.",
     "",
     `Сообщение менеджера:\n${message}`,

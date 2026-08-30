@@ -10,6 +10,7 @@ import {
 import {
   parseManagerCommand,
   describeActions,
+  cleanComposeInstruction,
   isCancelSend,
   isConfirmSend,
 } from "./managerCommandService.js";
@@ -246,7 +247,7 @@ function draftPreviewText({ phone, draft, instruction, files, fileCaption }) {
     phone ? `Черновик для ${formatPhoneDisplay(phone)}` : "Черновик без номера клиента",
     "",
     fileLines.length ? `Вложение: ${fileLines.join(", ")}` : null,
-    fileCaption ? `Подпись к файлу: «${fileCaption}»` : null,
+    fileLines.length && fileCaption ? `Подпись к файлу: «${fileCaption}»` : null,
     draft ? `«${draft}»` : null,
     "",
     instruction && !draft ? `Задача: ${instruction}` : null,
@@ -395,7 +396,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       if (!text && !files.length) {
         text = await composeClientMessage({
           lead: (await getLeadByPhone(pending.phone)) || { clientPhone: pending.phone },
-          instruction: pending.instruction || "Напиши клиенту короткое первое сообщение и уточни детали заявки.",
+          instruction: pending.instruction || "Напиши клиенту короткое сообщение по текущему контексту переписки.",
         });
       }
       const lead = await deliverToClient({
@@ -442,7 +443,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
   ) {
     actions = [
       ...actions,
-      { type: "AI_COMPOSE", value: message, text: null },
+      { type: "AI_COMPOSE", value: cleanComposeInstruction(message) || message, text: null },
     ];
   }
 
@@ -637,13 +638,27 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       }
 
       try {
-        const instruction = action.value || action.text || message;
+        const instruction =
+          cleanComposeInstruction(action.value || action.text || message) ||
+          String(action.value || action.text || message).trim();
         if (action.type === "EXACT_MESSAGE") {
           sentText = String(action.text || "").trim();
         } else {
+          const last = await getLastSend();
+          const extraContext = [
+            last?.ok && last.phone === targetPhone
+              ? `Недавно уже отправили клиенту: ${last.text}`
+              : "",
+            pending?.files?.length
+              ? `К этому сообщению приложен файл: ${describeFiles(pending.files).join(", ")}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join(". ");
           sentText = await composeClientMessage({
             lead: lead || { clientPhone: targetPhone, service: /презентац/i.test(message) ? "presentation" : lead?.service },
             instruction,
+            extraContext,
           });
         }
 
@@ -651,12 +666,13 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
           throw new Error("Пустой текст сообщения");
         }
 
+        const keepFiles = Boolean(pending?.files?.length);
         await setPendingOutbound({
           phone: targetPhone,
           draft: sentText,
           instruction,
-          fileCaption: pending?.fileCaption || "",
-          files: pending?.files || [],
+          fileCaption: keepFiles ? pending.fileCaption || "" : "",
+          files: keepFiles ? pending.files : [],
         });
 
         await notify(
@@ -664,8 +680,8 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
             phone: targetPhone,
             draft: sentText,
             instruction,
-            files: pending?.files || [],
-            fileCaption: pending?.fileCaption || "",
+            files: keepFiles ? pending.files : [],
+            fileCaption: keepFiles ? pending.fileCaption || "" : "",
           }),
         );
         return { ok: true, kind: "preview", phone: targetPhone };

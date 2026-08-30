@@ -93,10 +93,7 @@ function parseByRules(message) {
     actions.push({ type: "SEND_HERE", value: phone, text: null });
   }
 
-  const fileHint =
-    /(отправь|перешли|направь).{0,60}(файл|фото|документ|пдф|картинк)|прикрепи|вот (файл|фото|документ)/i.test(
-      text,
-    );
+  const fileHint = isFileSendCommand(text);
   if (fileHint) {
     actions.push({ type: "WAIT_FILE", value: phone, text: null });
   }
@@ -104,13 +101,13 @@ function parseByRules(message) {
   const composeHint =
     !exact &&
     !fileHint &&
-    /(скажи|объясни|предложи|уточни|узнай|напомин|нвпомин|попробуй|сделай акцент|отправь|закрой|доведи|подробност|заявк|напиши|свяжись|на этот номер|на указанный)/i.test(
+    /(скажи|объясни|предложи|уточни|узнай|напомин|нвпомин|напомани|попробуй|сделай акцент|отправь|закрой|доведи|подробност|заявк|напиши|свяжись|на этот номер|на указанный)/i.test(
       text,
     );
   if (composeHint) {
     actions.push({
       type: "AI_COMPOSE",
-      value: stripPhoneFromText(text),
+      value: cleanComposeInstruction(text),
       text: null,
     });
   }
@@ -222,6 +219,30 @@ export function isConfirmSend(message) {
 
 export function isCancelSend(message) {
   return CANCEL_SEND_RE.test(String(message || "").trim());
+}
+
+export function isFileSendCommand(message) {
+  const text = String(message || "").trim();
+  if (/(напомин|нвпомин|напомани|скажи|узнай|уточни|напиши|предложи|объясни)/i.test(text)) {
+    return false;
+  }
+  if (/прикрепи|вот (файл|фото|документ)/i.test(text)) {
+    return true;
+  }
+  return /(отправь|перешли|направь)(\s+\S+){0,4}\s+(этот\s+|вот\s+|это\s+)?(файл|фото|документ|пдф|вложение|картинку|картинка)(\s|$|[.,!?])/i.test(
+    text,
+  );
+}
+
+export function cleanComposeInstruction(message) {
+  return stripPhoneFromText(message)
+    .replace(/(отправь|перешли|направь|напиши)\s+/gi, " ")
+    .replace(
+      /на\s+(этот\s+|указанный\s+)?номер|по\s+(этому\s+)?номеру|этому\s+клиенту|клиенту|вот\s+сюда|(^|\s)(сюда|туда)(?=\s|$)/gi,
+      " ",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 export function describeActions(actions) {
