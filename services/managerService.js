@@ -103,7 +103,7 @@ async function sendToClient({ lead, text, phone }) {
 
   try {
     const sent = await sendWhatsAppMessage(chatId, text);
-    setLastSend({
+    await setLastSend({
       phone: destinationPhone,
       ok: true,
       text,
@@ -115,7 +115,7 @@ async function sendToClient({ lead, text, phone }) {
       idMessage: sent?.idMessage,
     });
   } catch (error) {
-    setLastSend({
+    await setLastSend({
       phone: destinationPhone,
       ok: false,
       text,
@@ -194,7 +194,7 @@ async function deliverToClient({ phone, text, instruction }) {
     lead = await getLeadById(lead.leadId);
   }
 
-  clearPendingOutbound();
+  await clearPendingOutbound();
   return lead;
 }
 
@@ -205,8 +205,9 @@ export async function handleManagerMessage({ message, senderChatId }) {
   }
 
   log("MANAGER", { message: String(message || "").slice(0, 300) });
+  const notify = (text) => notifyManagerRaw(text, senderChatId);
 
-  const pending = getPendingOutbound();
+  const pending = await getPendingOutbound();
   if (isConfirmSend(message) && pending?.phone) {
     try {
       const text =
@@ -220,7 +221,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
         text,
         instruction: pending.instruction,
       });
-      await notifyManagerRaw(
+      await notify(
         confirmationText({
           lead,
           actions: [{ type: "AI_COMPOSE", value: pending.instruction }],
@@ -230,7 +231,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
       );
       return { ok: true, sent: true, leadId: lead.leadId };
     } catch (error) {
-      await notifyManagerRaw(
+      await notify(
         [
           "❌ Не удалось отправить сообщение",
           "",
@@ -250,7 +251,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
     !actions.some((item) =>
       ["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"].includes(item.type),
     ) &&
-    /узнай|уточни|подробност|заявк|напиши|скажи|предложи|свяжись/i.test(message)
+    /узнай|уточни|подробност|заявк|напиши|скажи|предложи|свяжись|отправь|напомин/i.test(message)
   ) {
     actions = [
       ...actions,
@@ -260,17 +261,17 @@ export async function handleManagerMessage({ message, senderChatId }) {
 
   if (actions.some((item) => item.type === "LIST_LEADS")) {
     const leads = await listActiveLeads();
-    await notifyManagerRaw(formatActiveLeads(leads));
+    await notify(formatActiveLeads(leads));
     return { ok: true, kind: "list" };
   }
 
   if (actions.some((item) => item.type === "LAST_SEND_STATUS")) {
-    const last = getLastSend();
+    const last = await getLastSend();
     if (!last) {
-      await notifyManagerRaw("Пока не было попытки отправки клиенту.");
+      await notify("Пока не было попытки отправки клиенту.");
       return { ok: true, kind: "last_send" };
     }
-    await notifyManagerRaw(
+    await notify(
       last.ok
         ? `✅ Последняя отправка прошла.\n\nНомер: ${formatPhoneDisplay(last.phone)}\nСообщение: «${String(last.text).slice(0, 240)}»`
         : `❌ Последняя отправка не прошла.\n\nНомер: ${formatPhoneDisplay(last.phone)}\nПричина: ${last.error}`,
@@ -279,7 +280,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
   }
 
   if (actions.some((item) => item.type === "SEND_HERE") && parsed.phone) {
-    const draft = getPendingOutbound();
+    const draft = await getPendingOutbound();
     if (draft?.draft) {
       try {
         const lead = await deliverToClient({
@@ -287,7 +288,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
           text: draft.draft,
           instruction: draft.instruction,
         });
-        await notifyManagerRaw(
+        await notify(
           confirmationText({
             lead,
             actions: [{ type: "AI_COMPOSE", value: draft.instruction }],
@@ -297,7 +298,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
         );
         return { ok: true, sent: true, leadId: lead.leadId };
       } catch (error) {
-        await notifyManagerRaw(
+        await notify(
           [
             "❌ Не удалось отправить сообщение",
             "",
@@ -309,8 +310,8 @@ export async function handleManagerMessage({ message, senderChatId }) {
       }
     }
 
-    setPendingOutbound({ phone: parsed.phone, draft: "", instruction: "" });
-    await notifyManagerRaw(
+    await setPendingOutbound({ phone: parsed.phone, draft: "", instruction: "" });
+    await notify(
       `Номер принят: ${formatPhoneDisplay(parsed.phone)}\n\nНапишите, что отправить. Например:\n${parsed.phone} напомни про запуск проекта`,
     );
     return { ok: true, kind: "target" };
@@ -327,22 +328,22 @@ export async function handleManagerMessage({ message, senderChatId }) {
 
   if (actions.some((item) => item.type === "STATUS_QUERY")) {
     if (!lead) {
-      await notifyManagerRaw("❌ Клиент не найден. Укажите номер телефона.");
+      await notify("❌ Клиент не найден. Укажите номер телефона.");
       return { ok: false };
     }
-    await notifyManagerRaw(formatLeadSummary(lead));
+    await notify(formatLeadSummary(lead));
     return { ok: true, kind: "status", leadId: lead.leadId };
   }
 
   if (!lead && !parsed.phone && !parsed.leadId) {
-    await notifyManagerRaw(
+    await notify(
       "Не понял, к какому клиенту относится команда. Достаточно указать номер телефона.",
     );
     return { ok: false };
   }
 
   if (!lead && parsed.leadId && !parsed.phone) {
-    await notifyManagerRaw(`❌ ${parsed.leadId} не найден.`);
+    await notify(`❌ ${parsed.leadId} не найден.`);
     return { ok: false };
   }
 
@@ -416,7 +417,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
     if (["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"].includes(action.type)) {
       const targetPhone = lead?.clientPhone || parsed.phone;
       if (!targetPhone) {
-        await notifyManagerRaw("❌ Не указан номер клиента для отправки.");
+        await notify("❌ Не указан номер клиента для отправки.");
         return { ok: false };
       }
 
@@ -439,7 +440,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
           throw new Error("Пустой текст сообщения");
         }
 
-        setPendingOutbound({
+        await setPendingOutbound({
           phone: targetPhone,
           draft: sentText,
           instruction,
@@ -451,7 +452,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
           instruction: action.type === "EXACT_MESSAGE" ? "" : instruction,
         });
       } catch (error) {
-        await notifyManagerRaw(
+        await notify(
           [
             "❌ Не удалось отправить сообщение",
             "",
@@ -471,21 +472,25 @@ export async function handleManagerMessage({ message, senderChatId }) {
         value: message,
       });
     } else {
-      await notifyManagerRaw(
+      await notify(
         "Не понял команду. Пример: 87071234567 узнай бюджет",
       );
       return { ok: false };
     }
   }
 
-  await notifyManagerRaw(
-    confirmationText({
-      lead,
-      actions: actions.length ? actions : [{ type: "ADD_INSTRUCTION", value: message }],
-      sentText,
-      sentPhone: parsed.phone,
-    }),
-  );
+  try {
+    await notify(
+      confirmationText({
+        lead,
+        actions: actions.length ? actions : [{ type: "ADD_INSTRUCTION", value: message }],
+        sentText,
+        sentPhone: parsed.phone,
+      }),
+    );
+  } catch (error) {
+    log("NOTIFICATION", { confirmFailed: true, error: error.message });
+  }
 
   return { ok: true, leadId: lead?.leadId, sent: Boolean(sentText) };
 }

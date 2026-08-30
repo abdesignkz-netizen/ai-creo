@@ -1,6 +1,7 @@
 import { formatPhoneDisplay } from "./phoneService.js";
 import { hasNotification, markNotification } from "./leadService.js";
-import { sendManagerMessage } from "./whatsappService.js";
+import { sendManagerMessage, sendWhatsAppMessage } from "./whatsappService.js";
+import { getManagerChatId } from "./phoneService.js";
 import { log } from "./logger.js";
 
 function label(value) {
@@ -117,7 +118,28 @@ export async function notifyImportantEvent(lead, eventKey, note) {
   return notifyIfNeeded(lead, eventKey, lines.join("\n"));
 }
 
-export async function notifyManagerRaw(text) {
-  await sendManagerMessage(text);
-  log("NOTIFICATION", { raw: true });
+export async function notifyManagerRaw(text, senderChatId) {
+  const destinations = [...new Set([senderChatId, getManagerChatId()].filter(Boolean))];
+  let lastError = null;
+
+  for (const chatId of destinations) {
+    try {
+      await sendWhatsAppMessage(chatId, text);
+      log("NOTIFICATION", { raw: true, chatId });
+      return true;
+    } catch (error) {
+      lastError = error;
+      log("NOTIFICATION", { failed: true, chatId, error: error.message });
+    }
+  }
+
+  if (!destinations.length) {
+    await sendManagerMessage(text);
+    return true;
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+  return false;
 }
