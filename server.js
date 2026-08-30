@@ -7,7 +7,7 @@ import { createReadStream } from "fs";
 import os from "os";
 import { join } from "path";
 import { generateAiReply, getOpenAIClient } from "./services/aiService.js";
-import { handleClientMessage } from "./services/clientService.js";
+import { handleClientMessage, buildClientMessageWithMedia } from "./services/clientService.js";
 import { handleFailedOutboundStatus, handleManagerMessage } from "./services/managerService.js";
 import { noteOutgoingStatus } from "./services/whatsappService.js";
 import {
@@ -57,7 +57,9 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const pendingMessages = new Map();
-const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 800);
+const recentIncomingIds = new Map();
+const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 4000);
+const FOLLOWUP_BUFFER_MS = Math.max(1500, Math.round(MESSAGE_BUFFER_MS / 2));
 
 function validateEnv() {
   if (!process.env.OPENAI_API_KEY) {
@@ -387,6 +389,59 @@ function extractIncomingMedia(body) {
   };
 }
 
+function rememberIncomingId(sessionId, idMessage) {
+  if (!idMessage) {
+    return false;
+  }
+
+  let seen = recentIncomingIds.get(sessionId);
+  if (!seen) {
+    seen = [];
+    recentIncomingIds.set(sessionId, seen);
+  }
+
+  if (seen.includes(idMessage)) {
+    return true;
+  }
+
+  seen.push(idMessage);
+  if (seen.length > 80) {
+    seen.splice(0, seen.length - 80);
+  }
+  return false;
+}
+
+function takePendingBundle(pending) {
+  const messages = [...(pending.messages || [])];
+  const media = [...(pending.media || [])];
+  pending.messages = [];
+  pending.media = [];
+  return {
+    messages,
+    media,
+    version: pending.version,
+    senderName: pending.senderName,
+  };
+}
+
+function scheduleFlush(sessionId, chatId, delayMs = MESSAGE_BUFFER_MS) {
+  const pending = pendingMessages.get(sessionId);
+  if (!pending || pending.generating) {
+    return;
+  }
+
+  if (pending.timer) {
+    clearTimeout(pending.timer);
+  }
+
+  pending.timer = setTimeout(() => {
+    flushPendingChat(sessionId, chatId).catch((error) => {
+      console.error("BUFFERED MESSAGE ERROR:", error);
+      pendingMessages.delete(sessionId);
+    });
+  }, delayMs);
+}
+
 async function flushPendingChat(sessionId, chatId) {
   const pending = pendingMessages.get(sessionId);
   if (!pending || pending.generating) {
@@ -396,37 +451,57 @@ async function flushPendingChat(sessionId, chatId) {
   pending.generating = true;
   pending.timer = null;
 
-  const version = pending.version;
-  const combinedMessage = pending.messages.join("\n");
+  const bundle = takePendingBundle(pending);
+  const combinedMessage = buildClientMessageWithMedia(
+    bundle.messages.join("\n"),
+    bundle.media,
+  );
   const startedAt = Date.now();
+  let aborted = false;
 
   try {
+    if (!combinedMessage) {
+      return;
+    }
+
     if (isManagerPhone(chatId)) {
       await handleManagerMessage({
-        message: combinedMessage,
-        media: pending.media || [],
+        message: bundle.messages.join("\n"),
+        media: bundle.media,
         senderChatId: chatId,
       });
     } else {
-      await handleClientMessage({
+      const result = await handleClientMessage({
         chatId,
-        message: combinedMessage,
-        senderName: pending.senderName,
+        message: bundle.messages.join("\n"),
+        senderName: bundle.senderName,
+        media: bundle.media,
+        shouldAbort: () => {
+          const latest = pendingMessages.get(sessionId);
+          return Boolean(latest && latest.version !== bundle.version);
+        },
       });
+      aborted = Boolean(result?.aborted);
     }
   } finally {
     const latest = pendingMessages.get(sessionId);
-    if (latest && latest.version !== version) {
+    if (latest && (aborted || latest.version !== bundle.version)) {
+      if (aborted) {
+        latest.messages = [...bundle.messages, ...latest.messages];
+        latest.media = [...bundle.media, ...latest.media];
+      }
       latest.generating = false;
-      return flushPendingChat(sessionId, chatId);
+      scheduleFlush(sessionId, chatId, FOLLOWUP_BUFFER_MS);
+    } else {
+      pendingMessages.delete(sessionId);
     }
-    pendingMessages.delete(sessionId);
   }
 
   log("AI RESPONSE", {
     chatId,
     role: isManagerPhone(chatId) ? "MANAGER" : "CLIENT",
     bufferMs: MESSAGE_BUFFER_MS,
+    aborted,
     totalMs: Date.now() - startedAt + MESSAGE_BUFFER_MS,
   });
 }
@@ -473,19 +548,15 @@ app.post("/webhook", async (req, res) => {
       return res.json({ success: true, skipped: "no text message" });
     }
 
-    if (!isManager && !message) {
-      return res.json({ success: true, skipped: "no text message" });
+    const sessionId = chatId;
+    if (rememberIncomingId(sessionId, body.idMessage)) {
+      return res.json({ success: true, skipped: "duplicate incoming" });
     }
 
     const role = isManager ? "MANAGER" : "CLIENT";
     log(role, { phone: phoneFromChatId(chatId), buffered: true, hasFile: Boolean(media) });
 
-    const sessionId = chatId;
     const existing = pendingMessages.get(sessionId);
-
-    if (existing?.timer) {
-      clearTimeout(existing.timer);
-    }
 
     const pending = existing || {
       messages: [],
@@ -503,17 +574,11 @@ app.post("/webhook", async (req, res) => {
     }
     pending.version += 1;
     pending.senderName = pending.senderName || senderName;
+    pendingMessages.set(sessionId, pending);
 
     if (!pending.generating) {
-      pending.timer = setTimeout(() => {
-        flushPendingChat(sessionId, chatId).catch((error) => {
-          console.error("BUFFERED MESSAGE ERROR:", error);
-          pendingMessages.delete(sessionId);
-        });
-      }, MESSAGE_BUFFER_MS);
+      scheduleFlush(sessionId, chatId);
     }
-
-    pendingMessages.set(sessionId, pending);
 
     return res.json({
       success: true,

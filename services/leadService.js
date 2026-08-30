@@ -161,7 +161,7 @@ export function hasNotification(lead, eventKey) {
 
 export async function appendConversation(leadId, entries) {
   return updateLead(leadId, (lead) => {
-    const history = [...(lead.conversationHistory || []), ...entries].slice(-80);
+    const history = [...(lead.conversationHistory || []), ...entries].slice(-120);
     const lastClient = [...entries].reverse().find((item) => item.role === "user");
     const lastAi = [...entries].reverse().find((item) => item.role === "assistant");
     return {
