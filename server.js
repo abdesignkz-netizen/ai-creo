@@ -51,9 +51,12 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 const sessions = new Map();
-const MAX_HISTORY_MESSAGES = 100;
+const MAX_HISTORY_MESSAGES = Number(process.env.MAX_HISTORY_MESSAGES || 24);
 const pendingMessages = new Map();
-const MESSAGE_BUFFER_MS = 10000;
+const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 800);
+const OPENAI_REASONING_EFFORT = process.env.OPENAI_REASONING_EFFORT || "low";
+let cachedPromptFiles = null;
+let openaiClient = null;
 const FALLBACK_RESULT = {
   reply: "Не смог корректно обработать ответ. Передам менеджеру.",
   lead_status: "warm",
@@ -196,7 +199,21 @@ function buildLeadTelegramMessage({
   return lines.join("\n").slice(0, 4000);
 }
 
+function getOpenAIClient() {
+  if (!openaiClient) {
+    openaiClient = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+  }
+
+  return openaiClient;
+}
+
 async function loadPromptFiles() {
+  if (cachedPromptFiles) {
+    return cachedPromptFiles;
+  }
+
   const systemPromptPath = join(__dirname, "prompts", "system_prompt.txt");
   const knowledgePath = join(__dirname, "knowledge", "creolab_knowledge_base.txt");
 
@@ -205,7 +222,8 @@ async function loadPromptFiles() {
     readFile(knowledgePath, "utf-8"),
   ]);
 
-  return { systemPrompt, knowledgeBase };
+  cachedPromptFiles = { systemPrompt, knowledgeBase };
+  return cachedPromptFiles;
 }
 
 function formatHistory(history) {
@@ -222,10 +240,8 @@ function formatHistory(history) {
     .join("\n");
 }
 
-function buildAiInput({ systemPrompt, knowledgeBase, history, message }) {
+function buildAiInput({ knowledgeBase, history, message }) {
   return [
-    systemPrompt.trim(),
-    "",
     "=== БАЗА ЗНАНИЙ ===",
     knowledgeBase.trim(),
     "",
@@ -333,8 +349,6 @@ app.post("/test-ai", async (req, res) => {
   }
 
   const { message, sessionId = "test-user" } = req.body || {};
-  const history = sessions.get(sessionId) || [];
-
 
   if (!message || typeof message !== "string" || !message.trim()) {
     return res.status(400).json({
@@ -344,50 +358,17 @@ app.post("/test-ai", async (req, res) => {
   }
 
   try {
-    const { systemPrompt, knowledgeBase } = await loadPromptFiles();
-    const input = buildAiInput({
-      systemPrompt,
-      knowledgeBase,
-      history,
+    const { raw, result, latencyMs, nextHistory } = await generateAiReply({
+      sessionId,
       message: message.trim(),
     });
-
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-
-    const response = await openai.responses.create({
-      model: process.env.OPENAI_MODEL,
-      instructions: systemPrompt,
-      input: [
-        {
-          role: "user",
-          content: input,
-        },
-      ],
-    });
-
-    const raw = response.output_text || "";
-
-    let result;
-    try {
-      result = extractJsonFromText(raw);
-    } catch {
-      result = { ...FALLBACK_RESULT };
-    }
-    const updatedHistory = [
-      ...history,
-      { role: "user", content: message.trim() },
-      { role: "assistant", content: result.reply || raw },
-    ].slice(-MAX_HISTORY_MESSAGES);
-    
-    sessions.set(sessionId, updatedHistory);
-
+    commitAiHistory(sessionId, nextHistory);
 
     return res.json({
       success: true,
       raw,
       result,
+      latencyMs,
     });
   } catch (error) {
     return res.status(500).json({
@@ -429,19 +410,18 @@ async function generateAiReply({ sessionId, message }) {
   const { systemPrompt, knowledgeBase } = await loadPromptFiles();
 
   const input = buildAiInput({
-    systemPrompt,
     knowledgeBase,
     history,
     message: message.trim(),
   });
 
-  const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  });
-
-  const response = await openai.responses.create({
+  const startedAt = Date.now();
+  const response = await getOpenAIClient().responses.create({
     model: process.env.OPENAI_MODEL,
     instructions: systemPrompt,
+    reasoning: {
+      effort: OPENAI_REASONING_EFFORT,
+    },
     input: [
       {
         role: "user",
@@ -449,6 +429,7 @@ async function generateAiReply({ sessionId, message }) {
       },
     ],
   });
+  const latencyMs = Date.now() - startedAt;
 
   const raw = response.output_text || "";
 
@@ -467,9 +448,22 @@ async function generateAiReply({ sessionId, message }) {
     { role: "assistant", content: reply },
   ].slice(-MAX_HISTORY_MESSAGES);
 
-  sessions.set(sessionId, updatedHistory);
+  console.log("AI_REPLY", {
+    sessionId,
+    latencyMs,
+    model: process.env.OPENAI_MODEL,
+    reasoningEffort: OPENAI_REASONING_EFFORT,
+    inputChars: input.length,
+    historyMessages: history.length,
+  });
 
-  return { reply, result };
+  return { reply, result, raw, latencyMs, nextHistory: updatedHistory };
+}
+
+function commitAiHistory(sessionId, nextHistory) {
+  if (nextHistory) {
+    sessions.set(sessionId, nextHistory);
+  }
 }
 async function transcribeAudioFromUrl(fileUrl) {
   const response = await fetch(fileUrl);
@@ -483,12 +477,8 @@ async function transcribeAudioFromUrl(fileUrl) {
 
   await writeFile(tempFilePath, buffer);
 
-  const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
-  });
-
   try {
-    const transcription = await openai.audio.transcriptions.create({
+    const transcription = await getOpenAIClient().audio.transcriptions.create({
       file: createReadStream(tempFilePath),
       model: "whisper-1",
     });
@@ -521,6 +511,71 @@ async function extractIncomingText(body) {
 
   return "";
 }
+
+async function sendHandoffIfNeeded(chatId, result) {
+  if (result?.handoff !== true) {
+    return;
+  }
+
+  const phone = chatId.replace("@c.us", "");
+  const leadMessage = `
+🔥 Новый горячий лид
+
+Телефон:
++${phone}
+
+Услуга:
+${result.service || "не указана"}
+
+Резюме:
+${result.summary || "нет резюме"}
+`;
+
+  await sendWhatsAppMessage("77077471301@c.us", leadMessage);
+}
+
+async function flushPendingChat(sessionId, chatId) {
+  const pending = pendingMessages.get(sessionId);
+  if (!pending || pending.generating) {
+    return;
+  }
+
+  pending.generating = true;
+  pending.timer = null;
+
+  const version = pending.version;
+  const combinedMessage = pending.messages.join("\n");
+  const startedAt = Date.now();
+
+  const { reply, result, latencyMs, nextHistory } = await generateAiReply({
+    sessionId,
+    message: combinedMessage,
+  });
+
+  const current = pendingMessages.get(sessionId);
+  if (!current) {
+    return;
+  }
+
+  if (current.version !== version) {
+    current.generating = false;
+    console.log("AI_REPLY_UPDATED", { chatId, version, nextVersion: current.version });
+    return flushPendingChat(sessionId, chatId);
+  }
+
+  commitAiHistory(sessionId, nextHistory);
+  await sendWhatsAppMessage(chatId, reply);
+  await sendHandoffIfNeeded(chatId, result);
+  pendingMessages.delete(sessionId);
+
+  console.log("WHATSAPP_REPLY", {
+    chatId,
+    bufferMs: MESSAGE_BUFFER_MS,
+    aiMs: latencyMs,
+    totalMs: Date.now() - startedAt + MESSAGE_BUFFER_MS,
+  });
+}
+
 app.post("/webhook", async (req, res) => {
   console.log("WEBHOOK RECEIVED:", Date.now());
   try {
@@ -547,62 +602,38 @@ app.post("/webhook", async (req, res) => {
     }
 
     const sessionId = chatId;
+    const existing = pendingMessages.get(sessionId);
 
-const existing = pendingMessages.get(sessionId);
-
-if (existing?.timer) {
-  clearTimeout(existing.timer);
-}
-
-const messages = [...(existing?.messages || []), message.trim()];
-
-const timer = setTimeout(async () => {
-  try {
-    const combinedMessage = messages.join("\n");
-
-    const { reply, result } = await generateAiReply({
-      sessionId,
-      message: combinedMessage,
-    });
-    
-    await sendWhatsAppMessage(chatId, reply);
-    
-    if (result?.handoff === true) {
-      const phone = chatId.replace("@c.us", "");
-
-const leadMessage = `
-🔥 Новый горячий лид
-
-Телефон:
-+${phone}
-
-Услуга:
-${result.service || "не указана"}
-
-Резюме:
-${result.summary || "нет резюме"}
-`;
-    
-      await sendWhatsAppMessage("77077471301@c.us", leadMessage);
+    if (existing?.timer) {
+      clearTimeout(existing.timer);
     }
-    
-    pendingMessages.delete(sessionId);
-  } catch (error) {
-    console.error("BUFFERED MESSAGE ERROR:", error);
-    pendingMessages.delete(sessionId);
-  }
-}, MESSAGE_BUFFER_MS);
 
-pendingMessages.set(sessionId, {
-  messages,
-  timer,
-});
+    const pending = existing || {
+      messages: [],
+      version: 0,
+      generating: false,
+      timer: null,
+    };
 
-return res.json({
-  success: true,
-  buffered: true,
-  messagesCount: messages.length,
-});
+    pending.messages = [...pending.messages, message.trim()];
+    pending.version += 1;
+
+    if (!pending.generating) {
+      pending.timer = setTimeout(() => {
+        flushPendingChat(sessionId, chatId).catch((error) => {
+          console.error("BUFFERED MESSAGE ERROR:", error);
+          pendingMessages.delete(sessionId);
+        });
+      }, MESSAGE_BUFFER_MS);
+    }
+
+    pendingMessages.set(sessionId, pending);
+
+    return res.json({
+      success: true,
+      buffered: true,
+      messagesCount: pending.messages.length,
+    });
 
 
   } catch (error) {
