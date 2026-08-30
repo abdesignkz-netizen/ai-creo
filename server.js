@@ -8,7 +8,8 @@ import os from "os";
 import { join } from "path";
 import { generateAiReply, getOpenAIClient } from "./services/aiService.js";
 import { handleClientMessage } from "./services/clientService.js";
-import { handleManagerMessage } from "./services/managerService.js";
+import { handleFailedOutboundStatus, handleManagerMessage } from "./services/managerService.js";
+import { noteOutgoingStatus } from "./services/whatsappService.js";
 import {
   extractPhoneCandidate,
   extractPhoneFromVcard,
@@ -441,6 +442,21 @@ app.post("/webhook", async (req, res) => {
       "CHAT:",
       body.senderData?.chatId,
     );
+
+    if (body.typeWebhook === "outgoingMessageStatus") {
+      noteOutgoingStatus({
+        idMessage: body.idMessage,
+        status: body.status,
+        chatId: body.chatId,
+        description: body.description,
+      });
+      await handleFailedOutboundStatus({
+        chatId: body.chatId,
+        status: body.status,
+        description: body.description,
+      });
+      return res.json({ success: true, kind: "outgoing_status" });
+    }
 
     if (body.typeWebhook !== "incomingMessageReceived") {
       return res.json({ success: true, skipped: "not incoming message" });

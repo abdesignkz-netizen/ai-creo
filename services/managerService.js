@@ -15,8 +15,8 @@ import {
   isConfirmSend,
 } from "./managerCommandService.js";
 import { composeClientMessage } from "./aiService.js";
-import { checkWhatsAppNumber, inferFileName, sendWhatsAppFile, sendWhatsAppMessage } from "./whatsappService.js";
-import { extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, stripPhoneFromText, toChatId } from "./phoneService.js";
+import { checkWhatsAppNumber, confirmOutgoingDelivery, inferFileName, sendWhatsAppFile, sendWhatsAppMessage } from "./whatsappService.js";
+import { extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, phoneFromChatId, stripPhoneFromText, toChatId } from "./phoneService.js";
 import { notifyManagerRaw } from "./notificationService.js";
 import {
   clearPendingOutbound,
@@ -159,6 +159,14 @@ function hasPendingContent(pending) {
   );
 }
 
+async function requireWhatsAppNumber(phone) {
+  const check = await checkWhatsAppNumber(phone);
+  if (check.exists === false) {
+    throw new Error(check.reason || "Номер не зарегистрирован в WhatsApp");
+  }
+  return check;
+}
+
 async function sendToClient({ lead, text, phone, files = [] }) {
   const destinationPhone = lead?.clientPhone || phone;
   const chatId = toChatId(destinationPhone);
@@ -174,7 +182,7 @@ async function sendToClient({ lead, text, phone, files = [] }) {
 
   const check = await checkWhatsAppNumber(destinationPhone);
   if (check.exists === false) {
-    throw new Error(check.reason || "Номер недоступен в WhatsApp");
+    throw new Error(check.reason || "Номер не зарегистрирован в WhatsApp");
   }
 
   const summary = [
@@ -195,12 +203,23 @@ async function sendToClient({ lead, text, phone, files = [] }) {
       if (sent?.idMessage) {
         sentIds.push(sent.idMessage);
       }
+      await confirmOutgoingDelivery(sent?.idMessage, {
+        requireStatus: check.exists !== true,
+        timeoutMs: check.exists === true ? 1500 : 7000,
+      });
     }
     if (outgoingText) {
       const sent = await sendWhatsAppMessage(chatId, outgoingText);
       if (sent?.idMessage) {
         sentIds.push(sent.idMessage);
       }
+      await confirmOutgoingDelivery(sent?.idMessage, {
+        requireStatus: check.exists !== true,
+        timeoutMs: check.exists === true ? 1500 : 7000,
+      });
+    }
+    if (!sentIds.length) {
+      throw new Error("WhatsApp не принял сообщение");
     }
     await setLastSend({
       phone: destinationPhone,
@@ -366,6 +385,20 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       await notify("Файл принят. Укажите номер клиента, например: +77082555595");
       return { ok: true, kind: "need_phone" };
     }
+    try {
+      await requireWhatsAppNumber(phone);
+    } catch (error) {
+      await clearPendingOutbound();
+      await notify(
+        [
+          "❌ Нельзя отправить",
+          "",
+          `Номер: ${formatPhoneDisplay(phone)}`,
+          `Причина: ${error.message}`,
+        ].join("\n"),
+      );
+      return { ok: false, error: error.message };
+    }
     await notify(
       draftPreviewText({
         phone,
@@ -472,6 +505,19 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
     if (!phone) {
       await notify("Укажите номер клиента и пришлите фото или файл.");
       return { ok: false };
+    }
+    try {
+      await requireWhatsAppNumber(phone);
+    } catch (error) {
+      await notify(
+        [
+          "❌ Нельзя отправить",
+          "",
+          `Номер: ${formatPhoneDisplay(phone)}`,
+          `Причина: ${error.message}`,
+        ].join("\n"),
+      );
+      return { ok: false, error: error.message };
     }
     const caption = fileCaptionFromMessage(message) || pending?.fileCaption || "";
     await setPendingOutbound({
@@ -638,6 +684,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       }
 
       try {
+        await requireWhatsAppNumber(targetPhone);
         const instruction =
           cleanComposeInstruction(action.value || action.text || message) ||
           String(action.value || action.text || message).trim();
@@ -727,4 +774,36 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
   }
 
   return { ok: true, leadId: lead?.leadId, sent: Boolean(sentText) };
+}
+
+export async function handleFailedOutboundStatus({ chatId, status, description }) {
+  if (!/noAccount|failed/i.test(String(status || ""))) {
+    return;
+  }
+
+  const phone = phoneFromChatId(chatId);
+  const last = await getLastSend();
+  if (!last?.ok || !phone || last.phone !== phone) {
+    return;
+  }
+
+  const reason = /noAccount/i.test(status)
+    ? "Номер не зарегистрирован в WhatsApp"
+    : description || "WhatsApp не доставил сообщение";
+
+  await setLastSend({
+    phone,
+    ok: false,
+    text: last.text,
+    error: reason,
+  });
+
+  await notifyManagerRaw(
+    [
+      "❌ Уточнение по отправке",
+      "",
+      `Номер: ${formatPhoneDisplay(phone)}`,
+      `Причина: ${reason}. Сообщение клиенту не ушло.`,
+    ].join("\n"),
+  );
 }

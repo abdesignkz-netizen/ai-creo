@@ -43,6 +43,10 @@ function formatGreenApiFailure(data, httpStatus) {
 }
 
 export function assertGreenApiSent(data, httpStatus) {
+  if (data?.existsWhatsapp === false) {
+    throw new Error("Номер не зарегистрирован в WhatsApp");
+  }
+
   if (data?.idMessage) {
     const blocked = [data.correspondentsStatus, data.invokeStatus].some((item) =>
       isQuotaStatus(item?.status),
@@ -53,6 +57,80 @@ export function assertGreenApiSent(data, httpStatus) {
   }
 
   throw new Error(formatGreenApiFailure(data, httpStatus));
+}
+
+const lastOutgoingStatus = new Map();
+const outgoingStatusWaiters = new Map();
+
+export function noteOutgoingStatus({ idMessage, status, chatId, description }) {
+  if (!idMessage || !status) {
+    return;
+  }
+
+  const payload = { status, chatId: chatId || "", description: description || "" };
+  lastOutgoingStatus.set(idMessage, payload);
+
+  const waiters = outgoingStatusWaiters.get(idMessage) || [];
+  outgoingStatusWaiters.delete(idMessage);
+  for (const resolve of waiters) {
+    resolve(payload);
+  }
+}
+
+export function waitForOutgoingStatus(idMessage, timeoutMs = 6000) {
+  if (!idMessage) {
+    return Promise.resolve({ status: "timeout" });
+  }
+  if (lastOutgoingStatus.has(idMessage)) {
+    return Promise.resolve(lastOutgoingStatus.get(idMessage));
+  }
+
+  return new Promise((resolve) => {
+    const list = outgoingStatusWaiters.get(idMessage) || [];
+    const timer = setTimeout(() => {
+      outgoingStatusWaiters.set(
+        idMessage,
+        (outgoingStatusWaiters.get(idMessage) || []).filter((item) => item !== onStatus),
+      );
+      resolve({ status: "timeout" });
+    }, timeoutMs);
+    const onStatus = (payload) => {
+      clearTimeout(timer);
+      resolve(payload);
+    };
+    list.push(onStatus);
+    outgoingStatusWaiters.set(idMessage, list);
+  });
+}
+
+function deliveryFailureReason(status, description) {
+  if (/noAccount/i.test(status)) {
+    return "Номер не зарегистрирован в WhatsApp";
+  }
+  if (/failed/i.test(status)) {
+    return description || "WhatsApp не смог отправить сообщение";
+  }
+  if (/notInGroup/i.test(status)) {
+    return "Нельзя отправить: номер не в этом чате";
+  }
+  return "";
+}
+
+export async function confirmOutgoingDelivery(
+  idMessage,
+  { requireStatus = false, timeoutMs = 6000 } = {},
+) {
+  const result = await waitForOutgoingStatus(idMessage, timeoutMs);
+  const failure = deliveryFailureReason(result.status, result.description);
+  if (failure) {
+    throw new Error(failure);
+  }
+  if (requireStatus && result.status === "timeout") {
+    throw new Error(
+      "Не удалось подтвердить, что номер есть в WhatsApp. Сообщение не считаем доставленным.",
+    );
+  }
+  return result;
 }
 
 async function postGreenApi(path, payload) {
@@ -178,31 +256,46 @@ export async function checkWhatsAppNumber(phone) {
 
   try {
     const { apiToken, base } = getGreenApiBase();
-    const url = `${base}/checkWhatsapp/${apiToken}`;
-    const response = await fetch(url, {
+    const response = await fetch(`${base}/checkWhatsapp/${apiToken}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        phoneNumber: Number(normalized),
+        chatId: `${normalized}@c.us`,
+        force: true,
       }),
     });
 
-    if (!response.ok) {
-      return { exists: true, skipped: true };
-    }
-
     const data = await response.json().catch(() => null);
-    if (data && (data.correspondentsStatus || data.invokeStatus) && !data.existsWhatsapp) {
-      return { exists: true, skipped: true };
-    }
-    if (data && data.existsWhatsapp === false) {
+    log("WHATSAPP CHECK", {
+      phone: normalized,
+      http: response.status,
+      exists: data?.existsWhatsapp,
+    });
+
+    if (data?.existsWhatsapp === false) {
       return { exists: false, reason: "Номер не зарегистрирован в WhatsApp" };
     }
-    return { exists: true };
-  } catch {
-    return { exists: true, skipped: true };
+    if (data?.existsWhatsapp === true) {
+      return { exists: true };
+    }
+    if (!response.ok || /bad phone|valid from 11 to 16/i.test(JSON.stringify(data || ""))) {
+      return { exists: false, reason: "Некорректный или недоступный номер WhatsApp" };
+    }
+
+    return {
+      exists: null,
+      skipped: true,
+      reason: "Не удалось проверить, есть ли WhatsApp на номере",
+    };
+  } catch (error) {
+    log("WHATSAPP CHECK", { phone: normalized, error: error.message });
+    return {
+      exists: null,
+      skipped: true,
+      reason: error.message || "Не удалось проверить номер в WhatsApp",
+    };
   }
 }
 
