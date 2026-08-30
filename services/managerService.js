@@ -14,7 +14,9 @@ import { formatPhoneDisplay, isManagerPhone, toChatId } from "./phoneService.js"
 import { notifyManagerRaw } from "./notificationService.js";
 import {
   clearPendingOutbound,
+  getLastSend,
   getPendingOutbound,
+  setLastSend,
   setPendingOutbound,
 } from "./managerSession.js";
 import { log } from "./logger.js";
@@ -100,17 +102,28 @@ async function sendToClient({ lead, text, phone }) {
   }
 
   try {
-    await sendWhatsAppMessage(chatId, text);
+    const sent = await sendWhatsAppMessage(chatId, text);
+    setLastSend({
+      phone: destinationPhone,
+      ok: true,
+      text,
+    });
+    log("DIRECT SEND", {
+      leadId: lead?.leadId,
+      phone: destinationPhone,
+      chars: text.length,
+      idMessage: sent?.idMessage,
+    });
   } catch (error) {
+    setLastSend({
+      phone: destinationPhone,
+      ok: false,
+      text,
+      error: error.message,
+    });
     log("GREEN API ERROR", { phone: destinationPhone, error: error.message });
     throw error;
   }
-
-  log("DIRECT SEND", {
-    leadId: lead?.leadId,
-    phone: destinationPhone,
-    chars: text.length,
-  });
 
   return { chatId, phone: destinationPhone };
 }
@@ -138,7 +151,7 @@ function confirmationText({ lead, actions, sentText, sentPhone }) {
   }
 
   if (sentText) {
-    lines.push("", `Отправлено клиенту: «${sentText.slice(0, 240)}»`);
+    lines.push("", `WhatsApp принял сообщение для клиента: «${sentText.slice(0, 240)}»`);
   }
 
   if (lead?.aiMode === "HUMAN") {
@@ -249,6 +262,58 @@ export async function handleManagerMessage({ message, senderChatId }) {
     const leads = await listActiveLeads();
     await notifyManagerRaw(formatActiveLeads(leads));
     return { ok: true, kind: "list" };
+  }
+
+  if (actions.some((item) => item.type === "LAST_SEND_STATUS")) {
+    const last = getLastSend();
+    if (!last) {
+      await notifyManagerRaw("Пока не было попытки отправки клиенту.");
+      return { ok: true, kind: "last_send" };
+    }
+    await notifyManagerRaw(
+      last.ok
+        ? `✅ Последняя отправка прошла.\n\nНомер: ${formatPhoneDisplay(last.phone)}\nСообщение: «${String(last.text).slice(0, 240)}»`
+        : `❌ Последняя отправка не прошла.\n\nНомер: ${formatPhoneDisplay(last.phone)}\nПричина: ${last.error}`,
+    );
+    return { ok: last.ok, kind: "last_send" };
+  }
+
+  if (actions.some((item) => item.type === "SEND_HERE") && parsed.phone) {
+    const draft = getPendingOutbound();
+    if (draft?.draft) {
+      try {
+        const lead = await deliverToClient({
+          phone: parsed.phone,
+          text: draft.draft,
+          instruction: draft.instruction,
+        });
+        await notifyManagerRaw(
+          confirmationText({
+            lead,
+            actions: [{ type: "AI_COMPOSE", value: draft.instruction }],
+            sentText: draft.draft,
+            sentPhone: parsed.phone,
+          }),
+        );
+        return { ok: true, sent: true, leadId: lead.leadId };
+      } catch (error) {
+        await notifyManagerRaw(
+          [
+            "❌ Не удалось отправить сообщение",
+            "",
+            `Номер: ${formatPhoneDisplay(parsed.phone)}`,
+            `Причина: ${error.message}`,
+          ].join("\n"),
+        );
+        return { ok: false, error: error.message };
+      }
+    }
+
+    setPendingOutbound({ phone: parsed.phone, draft: "", instruction: "" });
+    await notifyManagerRaw(
+      `Номер принят: ${formatPhoneDisplay(parsed.phone)}\n\nНапишите, что отправить. Например:\n${parsed.phone} напомни про запуск проекта`,
+    );
+    return { ok: true, kind: "target" };
   }
 
   const needsSend = actions.some((item) =>

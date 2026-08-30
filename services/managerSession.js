@@ -1,4 +1,5 @@
 let pendingOutbound = null;
+let lastSend = null;
 
 export function setPendingOutbound(payload) {
   pendingOutbound = {
@@ -22,4 +23,18 @@ export function getPendingOutbound() {
 
 export function clearPendingOutbound() {
   pendingOutbound = null;
+}
+
+export function setLastSend(payload) {
+  lastSend = {
+    phone: payload.phone,
+    ok: Boolean(payload.ok),
+    text: payload.text || "",
+    error: payload.error || "",
+    createdAt: Date.now(),
+  };
+}
+
+export function getLastSend() {
+  return lastSend;
 }

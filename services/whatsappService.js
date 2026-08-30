@@ -14,6 +14,47 @@ function getGreenApiBase() {
   };
 }
 
+function isQuotaStatus(status) {
+  return /EXCEED|QUOTE_EXCEED/i.test(String(status || ""));
+}
+
+function formatGreenApiFailure(data, httpStatus) {
+  const blocks = [data?.correspondentsStatus, data?.invokeStatus, data?.quotaData].filter(Boolean);
+  const quota = blocks.find((item) => isQuotaStatus(item.status) || item.description);
+  if (quota?.description || blocks.length) {
+    const description = quota?.description || blocks[0]?.description || "";
+    const allowed = String(description).match(/(\d{10,15}@c\.us)/g) || [];
+    const lines = [
+      "Green API не доставил сообщение: лимит тарифа Developer.",
+      "На этом тарифе можно писать только уже открытым чатам (обычно 3 номера).",
+    ];
+    if (allowed.length) {
+      lines.push(`Разрешённые номера: ${allowed.map((item) => item.replace("@c.us", "")).join(", ")}`);
+    }
+    lines.push("Смените тариф на Business: https://console.green-api.com");
+    return lines.join(" ");
+  }
+
+  if (typeof data === "string") {
+    return data;
+  }
+
+  return `Green API HTTP ${httpStatus || ""}`.trim();
+}
+
+export function assertGreenApiSent(data, httpStatus) {
+  if (data?.idMessage) {
+    const blocked = [data.correspondentsStatus, data.invokeStatus].some((item) =>
+      isQuotaStatus(item?.status),
+    );
+    if (!blocked) {
+      return data;
+    }
+  }
+
+  throw new Error(formatGreenApiFailure(data, httpStatus));
+}
+
 export async function sendWhatsAppMessage(chatId, message) {
   const { apiToken, base } = getGreenApiBase();
   const url = `${base}/sendMessage/${apiToken}`;
@@ -29,13 +70,25 @@ export async function sendWhatsAppMessage(chatId, message) {
     }),
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    log("GREEN API ERROR", { chatId, status: response.status });
-    throw new Error(errorText || `Green API HTTP ${response.status}`);
+  const raw = await response.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = raw;
   }
 
-  return response.json();
+  if (!response.ok || response.status === 466) {
+    log("GREEN API ERROR", { chatId, status: response.status });
+    throw new Error(formatGreenApiFailure(data, response.status));
+  }
+
+  try {
+    return assertGreenApiSent(data, response.status);
+  } catch (error) {
+    log("GREEN API ERROR", { chatId, status: response.status, quota: true });
+    throw error;
+  }
 }
 
 export async function sendManagerMessage(message) {
@@ -70,6 +123,9 @@ export async function checkWhatsAppNumber(phone) {
     }
 
     const data = await response.json().catch(() => null);
+    if (data && (data.correspondentsStatus || data.invokeStatus) && !data.existsWhatsapp) {
+      return { exists: true, skipped: true };
+    }
     if (data && data.existsWhatsapp === false) {
       return { exists: false, reason: "Номер не зарегистрирован в WhatsApp" };
     }

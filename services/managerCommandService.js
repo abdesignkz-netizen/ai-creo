@@ -48,6 +48,14 @@ function parseByRules(message) {
     actions.push({ type: "SET_MODE", value: "AUTO", text: null });
   }
 
+  if (/отправил\??|ушло\??|дошло\??|отправилось\??/i.test(text)) {
+    actions.push({ type: "LAST_SEND_STATUS", value: null, text: null });
+  }
+
+  if (phone && /сюда|на этот номер|вот сюда/i.test(text)) {
+    actions.push({ type: "SEND_HERE", value: phone, text: null });
+  }
+
   if (/передай мне|забери клиента|human/i.test(text)) {
     actions.push({ type: "SET_MODE", value: "HUMAN", text: null });
   }
@@ -80,6 +88,11 @@ function parseByRules(message) {
     });
   }
 
+  const leftover = stripPhoneFromText(text).replace(/[!?.,]+/g, "").trim();
+  if (phone && leftover.length === 0) {
+    actions.push({ type: "SEND_HERE", value: phone, text: null });
+  }
+
   const composeHint =
     !exact &&
     /(скажи|объясни|предложи|уточни|узнай|напомни|попробуй|сделай акцент|отправь кп|закрой|доведи|подробност|заявк|напиши|свяжись|на этот номер|на указанный)/i.test(
@@ -103,7 +116,10 @@ function parseByRules(message) {
 
 function rulesAreComplete(parsed) {
   const types = new Set((parsed.actions || []).map((item) => item.type));
-  if (types.has("LIST_LEADS")) {
+  if (types.has("LIST_LEADS") || types.has("LAST_SEND_STATUS")) {
+    return true;
+  }
+  if (types.has("SEND_HERE") && parsed.phone) {
     return true;
   }
   if (types.has("STATUS_QUERY") && (parsed.phone || parsed.leadId)) {
@@ -212,6 +228,12 @@ export function describeActions(actions) {
       }
       if (action.type === "LIST_LEADS") {
         return "Список активных лидов";
+      }
+      if (action.type === "LAST_SEND_STATUS") {
+        return "Проверка последней отправки";
+      }
+      if (action.type === "SEND_HERE") {
+        return `Отправить на ${action.value}`;
       }
       return action.type;
     })
