@@ -9,7 +9,12 @@ import { join } from "path";
 import { generateAiReply, getOpenAIClient } from "./services/aiService.js";
 import { handleClientMessage } from "./services/clientService.js";
 import { handleManagerMessage } from "./services/managerService.js";
-import { isManagerPhone, phoneFromChatId } from "./services/phoneService.js";
+import {
+  extractPhoneCandidate,
+  extractPhoneFromVcard,
+  isManagerPhone,
+  phoneFromChatId,
+} from "./services/phoneService.js";
 import { log } from "./services/logger.js";
 
 dotenv.config();
@@ -322,23 +327,34 @@ async function transcribeAudioFromUrl(fileUrl) {
 
 async function extractIncomingText(body) {
   const typeMessage = body?.messageData?.typeMessage;
+  const parts = [];
 
   if (typeMessage === "textMessage") {
-    return body.messageData?.textMessageData?.textMessage || "";
-  }
-
-  if (typeMessage === "extendedTextMessage") {
-    return body.messageData?.extendedTextMessageData?.text || "";
-  }
-
-  if (typeMessage === "audioMessage") {
+    parts.push(body.messageData?.textMessageData?.textMessage || "");
+  } else if (typeMessage === "extendedTextMessage") {
+    const extra = body.messageData?.extendedTextMessageData || {};
+    parts.push(extra.text || extra.description || extra.title || "");
+  } else if (typeMessage === "quotedMessage") {
+    parts.push(body.messageData?.extendedTextMessageData?.text || "");
+  } else if (typeMessage === "audioMessage") {
     const fileUrl = body.messageData?.fileMessageData?.downloadUrl;
-    if (!fileUrl) return "";
-    const text = await transcribeAudioFromUrl(fileUrl);
-    return text ? `[Голосовое сообщение]: ${text}` : "";
+    if (fileUrl) {
+      const text = await transcribeAudioFromUrl(fileUrl);
+      if (text) parts.push(`[Голосовое сообщение]: ${text}`);
+    }
+  } else if (typeMessage === "contactMessage") {
+    const contact = body.messageData?.contactMessageData || {};
+    const phone =
+      extractPhoneFromVcard(contact.vcard) ||
+      extractPhoneCandidate(contact.displayName || "");
+    if (phone) parts.push(phone);
+    if (contact.displayName) parts.push(contact.displayName);
   }
 
-  return "";
+  const caption = body.messageData?.fileMessageData?.caption;
+  if (caption) parts.push(caption);
+
+  return parts.filter(Boolean).join("\n").trim();
 }
 
 async function flushPendingChat(sessionId, chatId) {
@@ -358,6 +374,7 @@ async function flushPendingChat(sessionId, chatId) {
     if (isManagerPhone(chatId)) {
       await handleManagerMessage({
         message: combinedMessage,
+        senderChatId: chatId,
       });
     } else {
       await handleClientMessage({

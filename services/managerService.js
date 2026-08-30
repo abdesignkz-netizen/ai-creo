@@ -7,11 +7,16 @@ import {
   listActiveLeads,
   updateLead,
 } from "./leadService.js";
-import { parseManagerCommand, describeActions } from "./managerCommandService.js";
+import { parseManagerCommand, describeActions, isConfirmSend } from "./managerCommandService.js";
 import { composeClientMessage } from "./aiService.js";
 import { checkWhatsAppNumber, sendWhatsAppMessage } from "./whatsappService.js";
-import { formatPhoneDisplay, toChatId } from "./phoneService.js";
+import { formatPhoneDisplay, isManagerPhone, toChatId } from "./phoneService.js";
 import { notifyManagerRaw } from "./notificationService.js";
+import {
+  clearPendingOutbound,
+  getPendingOutbound,
+  setPendingOutbound,
+} from "./managerSession.js";
 import { log } from "./logger.js";
 
 function formatLeadSummary(lead) {
@@ -147,11 +152,98 @@ function confirmationText({ lead, actions, sentText, sentPhone }) {
   return lines.join("\n");
 }
 
-export async function handleManagerMessage({ message }) {
+async function deliverToClient({ phone, text, instruction }) {
+  const targetPhone = phone;
+  if (!targetPhone || !text) {
+    throw new Error("Нет номера или текста для отправки");
+  }
+
+  await sendToClient({ text, phone: targetPhone });
+
+  let lead = await getLeadByPhone(targetPhone);
+  if (!lead) {
+    lead = await getOrCreateLeadByPhone(targetPhone, {
+      source: "manager_outbound",
+      direction: "outbound",
+    });
+    log("OUTBOUND LEAD", { leadId: lead.leadId, phone: targetPhone });
+  }
+
+  lead = await appendConversation(lead.leadId, [
+    { role: "assistant", content: text },
+  ]);
+
+  if (instruction) {
+    await addManagerInstruction(lead.leadId, {
+      type: "AI_COMPOSE",
+      value: instruction,
+    });
+    lead = await getLeadById(lead.leadId);
+  }
+
+  clearPendingOutbound();
+  return lead;
+}
+
+export async function handleManagerMessage({ message, senderChatId }) {
+  if (senderChatId && !isManagerPhone(senderChatId)) {
+    log("MANAGER", { rejected: true, sender: senderChatId });
+    return { ok: false, error: "not_manager" };
+  }
+
   log("MANAGER", { message: String(message || "").slice(0, 300) });
 
+  const pending = getPendingOutbound();
+  if (isConfirmSend(message) && pending?.phone) {
+    try {
+      const text =
+        pending.draft ||
+        (await composeClientMessage({
+          lead: (await getLeadByPhone(pending.phone)) || { clientPhone: pending.phone },
+          instruction: pending.instruction || "Напиши клиенту короткое первое сообщение и уточни детали заявки.",
+        }));
+      const lead = await deliverToClient({
+        phone: pending.phone,
+        text,
+        instruction: pending.instruction,
+      });
+      await notifyManagerRaw(
+        confirmationText({
+          lead,
+          actions: [{ type: "AI_COMPOSE", value: pending.instruction }],
+          sentText: text,
+          sentPhone: pending.phone,
+        }),
+      );
+      return { ok: true, sent: true, leadId: lead.leadId };
+    } catch (error) {
+      await notifyManagerRaw(
+        [
+          "❌ Не удалось отправить сообщение",
+          "",
+          `Номер: ${formatPhoneDisplay(pending.phone)}`,
+          `Причина: ${error.message}`,
+        ].join("\n"),
+      );
+      return { ok: false, error: error.message };
+    }
+  }
+
   const parsed = await parseManagerCommand(message);
-  const actions = dedupeActions(parsed.actions || []);
+  let actions = dedupeActions(parsed.actions || []);
+
+  if (
+    parsed.phone &&
+    !actions.some((item) =>
+      ["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"].includes(item.type),
+    ) &&
+    /узнай|уточни|подробност|заявк|напиши|скажи|предложи|свяжись/i.test(message)
+  ) {
+    actions = [
+      ...actions,
+      { type: "AI_COMPOSE", value: message, text: null },
+    ];
+  }
 
   if (actions.some((item) => item.type === "LIST_LEADS")) {
     const leads = await listActiveLeads();
@@ -268,12 +360,12 @@ export async function handleManagerMessage({ message }) {
       }
 
       try {
+        const instruction = action.value || action.text || message;
         if (action.type === "EXACT_MESSAGE") {
           sentText = String(action.text || "").trim();
         } else {
-          const instruction = action.value || action.text || message;
           sentText = await composeClientMessage({
-            lead: lead || { clientPhone: targetPhone },
+            lead: lead || { clientPhone: targetPhone, service: /презентац/i.test(message) ? "presentation" : lead?.service },
             instruction,
           });
         }
@@ -282,26 +374,17 @@ export async function handleManagerMessage({ message }) {
           throw new Error("Пустой текст сообщения");
         }
 
-        await sendToClient({ lead, text: sentText, phone: targetPhone });
+        setPendingOutbound({
+          phone: targetPhone,
+          draft: sentText,
+          instruction,
+        });
 
-        if (!lead) {
-          lead = await getOrCreateLeadByPhone(targetPhone, {
-            source: "manager_outbound",
-            direction: "outbound",
-          });
-          log("OUTBOUND LEAD", { leadId: lead.leadId, phone: targetPhone });
-        }
-
-        lead = await appendConversation(lead.leadId, [
-          { role: "assistant", content: sentText },
-        ]);
-
-        if (action.type !== "EXACT_MESSAGE") {
-          await addManagerInstruction(lead.leadId, {
-            type: action.type,
-            value: action.value || action.text,
-          });
-        }
+        lead = await deliverToClient({
+          phone: targetPhone,
+          text: sentText,
+          instruction: action.type === "EXACT_MESSAGE" ? "" : instruction,
+        });
       } catch (error) {
         await notifyManagerRaw(
           [

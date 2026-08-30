@@ -82,7 +82,7 @@ function parseByRules(message) {
 
   const composeHint =
     !exact &&
-    /(скажи|объясни|предложи|уточни|узнай|напомни|попробуй|сделай акцент|отправь кп|закрой|доведи)/i.test(
+    /(скажи|объясни|предложи|уточни|узнай|напомни|попробуй|сделай акцент|отправь кп|закрой|доведи|подробност|заявк|напиши|свяжись|на этот номер|на указанный)/i.test(
       text,
     );
   if (composeHint) {
@@ -162,6 +162,28 @@ export async function parseManagerCommand(message) {
     log("MANAGER COMMAND", { parseFallback: true, error: error.message });
     return fallback;
   }
+}
+
+const COMMAND_HINT_RE =
+  /отправь|напиши|скажи|узнай|уточни|предложи|напомни|подробност|заявк|свяжись|остановись|продолжай|ниже|скидк|что с|активные лиды|покажи лиды/i;
+
+const CONFIRM_SEND_RE =
+  /(отправь|перешли|направь).*(номер|туда|клиенту|не сюда|это сообщение)|^(да[,.]?\s*)(отправь|перешли)?$/i;
+
+export function looksLikeManagerCommand(message, senderPhone) {
+  const text = String(message || "").trim();
+  const target = extractPhoneCandidate(text);
+  if (target && target !== normalizePhone(senderPhone) && COMMAND_HINT_RE.test(text)) {
+    return true;
+  }
+  if (CONFIRM_SEND_RE.test(text)) {
+    return true;
+  }
+  return /активные лиды|покажи лиды/i.test(text);
+}
+
+export function isConfirmSend(message) {
+  return CONFIRM_SEND_RE.test(String(message || "").trim());
 }
 
 export function describeActions(actions) {

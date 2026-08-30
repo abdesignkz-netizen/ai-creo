@@ -1,5 +1,7 @@
 const KZ_PHONE_RE =
   /(?:\+?7|8)[\s-]?\(?7\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}/;
+const WA_LINK_RE = /(?:wa\.me|api\.whatsapp\.com\/send\?phone=)\/?(\d{10,15})/i;
+const DEFAULT_MANAGER_PHONE = "77077471301";
 
 export function normalizePhone(input) {
   if (input === undefined || input === null) {
@@ -51,8 +53,18 @@ export function formatPhoneDisplay(input) {
   return `+${phone[0]} ${phone.slice(1, 4)} ${phone.slice(4, 7)} ${phone.slice(7, 9)} ${phone.slice(9)}`;
 }
 
+export function extractPhoneFromVcard(vcard) {
+  const match = String(vcard || "").match(/TEL[^:]*:([+\d\s()-]+)/i);
+  return match ? normalizePhone(match[1]) : null;
+}
+
 export function extractPhoneCandidate(text) {
   const raw = String(text || "");
+  const link = raw.match(WA_LINK_RE);
+  if (link) {
+    return normalizePhone(link[1]);
+  }
+
   const match = raw.match(KZ_PHONE_RE);
   if (match) {
     return normalizePhone(match[0]);
@@ -70,12 +82,22 @@ export function stripPhoneFromText(text) {
     .trim();
 }
 
+export function getManagerPhones() {
+  const fromEnv = [process.env.MANAGER_PHONE, process.env.MANAGER_CHAT_ID]
+    .filter(Boolean)
+    .join(",");
+  const raw = fromEnv || DEFAULT_MANAGER_PHONE;
+
+  const phones = raw
+    .split(/[,;]+/)
+    .map((item) => normalizePhone(item))
+    .filter(Boolean);
+
+  return [...new Set(phones)];
+}
+
 export function getManagerPhone() {
-  return (
-    normalizePhone(process.env.MANAGER_PHONE) ||
-    normalizePhone(process.env.MANAGER_CHAT_ID) ||
-    null
-  );
+  return getManagerPhones()[0] || null;
 }
 
 export function getManagerChatId() {
@@ -84,7 +106,6 @@ export function getManagerChatId() {
 }
 
 export function isManagerPhone(input) {
-  const managerPhone = getManagerPhone();
   const incoming = normalizePhone(input);
-  return Boolean(managerPhone && incoming && managerPhone === incoming);
+  return Boolean(incoming && getManagerPhones().includes(incoming));
 }
