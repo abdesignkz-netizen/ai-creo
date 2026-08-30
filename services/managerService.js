@@ -7,10 +7,15 @@ import {
   listActiveLeads,
   updateLead,
 } from "./leadService.js";
-import { parseManagerCommand, describeActions, isConfirmSend } from "./managerCommandService.js";
+import {
+  parseManagerCommand,
+  describeActions,
+  isCancelSend,
+  isConfirmSend,
+} from "./managerCommandService.js";
 import { composeClientMessage } from "./aiService.js";
-import { checkWhatsAppNumber, sendWhatsAppMessage } from "./whatsappService.js";
-import { formatPhoneDisplay, isManagerPhone, toChatId } from "./phoneService.js";
+import { checkWhatsAppNumber, inferFileName, sendWhatsAppFile, sendWhatsAppMessage } from "./whatsappService.js";
+import { extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, stripPhoneFromText, toChatId } from "./phoneService.js";
 import { notifyManagerRaw } from "./notificationService.js";
 import {
   clearPendingOutbound,
@@ -89,11 +94,69 @@ async function resolveLead({ leadId, phone, createIfMissing, extras }) {
   return null;
 }
 
-async function sendToClient({ lead, text, phone }) {
+function normalizePendingFiles(files) {
+  return (Array.isArray(files) ? files : [])
+    .filter((file) => file && (file.url || file.idMessage))
+    .map((file) => ({
+      type: file.type || "",
+      url: file.url || "",
+      fileName: inferFileName(file),
+      mimeType: file.mimeType || "",
+      caption: file.caption || "",
+      idMessage: file.idMessage || "",
+      chatIdFrom: file.chatIdFrom || "",
+    }));
+}
+
+function fileKindLabel(file) {
+  const type = String(file?.type || "");
+  const mime = String(file?.mimeType || "");
+  if (type === "imageMessage" || type === "stickerMessage" || mime.startsWith("image/")) {
+    return "фото";
+  }
+  if (type === "videoMessage" || mime.startsWith("video/")) {
+    return "видео";
+  }
+  return "файл";
+}
+
+function describeFiles(files) {
+  return normalizePendingFiles(files).map(
+    (file) => `${fileKindLabel(file)}: ${file.fileName}`,
+  );
+}
+
+function fileCaptionFromMessage(message) {
+  const cleaned = stripPhoneFromText(message)
+    .replace(
+      /^(отправь|перешли|направь)(\s+(этот|вот|это))?\s*(файл|фото|документ|пдф|картинку|картинка)?\s*/i,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned || isConfirmSend(cleaned) || isCancelSend(cleaned)) {
+    return "";
+  }
+  return cleaned;
+}
+
+function hasPendingContent(pending) {
+  return Boolean(
+    pending && (pending.phone || pending.draft || pending.files?.length),
+  );
+}
+
+async function sendToClient({ lead, text, phone, files = [] }) {
   const destinationPhone = lead?.clientPhone || phone;
   const chatId = toChatId(destinationPhone);
   if (!chatId) {
     throw new Error("Не удалось определить номер получателя");
+  }
+
+  const outgoingFiles = normalizePendingFiles(files);
+  const outgoingText = String(text || "").trim();
+  if (!outgoingText && !outgoingFiles.length) {
+    throw new Error("Нет текста или файла для отправки");
   }
 
   const check = await checkWhatsAppNumber(destinationPhone);
@@ -101,24 +164,48 @@ async function sendToClient({ lead, text, phone }) {
     throw new Error(check.reason || "Номер недоступен в WhatsApp");
   }
 
+  const summary = [
+    outgoingFiles.length ? `[${describeFiles(outgoingFiles).join(", ")}]` : "",
+    outgoingText,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
   try {
-    const sent = await sendWhatsAppMessage(chatId, text);
+    const sentIds = [];
+    for (let index = 0; index < outgoingFiles.length; index += 1) {
+      const file = outgoingFiles[index];
+      const sent = await sendWhatsAppFile(chatId, {
+        ...file,
+        caption: index === 0 ? file.caption || "" : "",
+      });
+      if (sent?.idMessage) {
+        sentIds.push(sent.idMessage);
+      }
+    }
+    if (outgoingText) {
+      const sent = await sendWhatsAppMessage(chatId, outgoingText);
+      if (sent?.idMessage) {
+        sentIds.push(sent.idMessage);
+      }
+    }
     await setLastSend({
       phone: destinationPhone,
       ok: true,
-      text,
+      text: summary,
     });
     log("DIRECT SEND", {
       leadId: lead?.leadId,
       phone: destinationPhone,
-      chars: text.length,
-      idMessage: sent?.idMessage,
+      chars: outgoingText.length,
+      files: outgoingFiles.map((file) => file.fileName),
+      idMessage: sentIds[0],
     });
   } catch (error) {
     await setLastSend({
       phone: destinationPhone,
       ok: false,
-      text,
+      text: summary,
       error: error.message,
     });
     log("GREEN API ERROR", { phone: destinationPhone, error: error.message });
@@ -141,13 +228,36 @@ function dedupeActions(actions) {
   return other;
 }
 
-function confirmationText({ lead, actions, sentText, sentPhone }) {
+function draftPreviewText({ phone, draft, instruction, files, fileCaption }) {
+  const fileLines = describeFiles(files);
+  return [
+    phone ? `Черновик для ${formatPhoneDisplay(phone)}` : "Черновик без номера клиента",
+    "",
+    fileLines.length ? `Вложение: ${fileLines.join(", ")}` : null,
+    fileCaption ? `Подпись к файлу: «${fileCaption}»` : null,
+    draft ? `«${draft}»` : null,
+    "",
+    instruction && !draft ? `Задача: ${instruction}` : null,
+    "",
+    phone ? "Отправить клиенту?" : "Укажите номер клиента, затем напишите: да / отправь",
+    phone ? "Напишите: да / отправь" : null,
+    "Или: нет / отмена",
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+}
+
+function confirmationText({ lead, actions, sentText, sentPhone, sentFiles }) {
   const header = formatPhoneDisplay(lead?.clientPhone || sentPhone);
   const details = describeActions(actions);
   const lines = ["✅ " + header, "", "Принято."];
 
   if (details.length) {
     lines.push("", ...details);
+  }
+
+  if (sentFiles?.length) {
+    lines.push("", `WhatsApp принял файл для клиента: ${describeFiles(sentFiles).join(", ")}`);
   }
 
   if (sentText) {
@@ -165,13 +275,18 @@ function confirmationText({ lead, actions, sentText, sentPhone }) {
   return lines.join("\n");
 }
 
-async function deliverToClient({ phone, text, instruction }) {
+async function deliverToClient({ phone, text, instruction, files, fileCaption }) {
   const targetPhone = phone;
-  if (!targetPhone || !text) {
-    throw new Error("Нет номера или текста для отправки");
+  const outgoingFiles = normalizePendingFiles(files).map((file, index) => ({
+    ...file,
+    caption: index === 0 ? file.caption || fileCaption || "" : "",
+  }));
+  const outgoingText = String(text || "").trim();
+  if (!targetPhone || (!outgoingText && !outgoingFiles.length)) {
+    throw new Error("Нет номера, текста или файла для отправки");
   }
 
-  await sendToClient({ text, phone: targetPhone });
+  await sendToClient({ text: outgoingText, phone: targetPhone, files: outgoingFiles });
 
   let lead = await getLeadByPhone(targetPhone);
   if (!lead) {
@@ -182,8 +297,15 @@ async function deliverToClient({ phone, text, instruction }) {
     log("OUTBOUND LEAD", { leadId: lead.leadId, phone: targetPhone });
   }
 
+  const historyText = [
+    outgoingFiles.length ? `[Файл: ${outgoingFiles.map((file) => file.fileName).join(", ")}]` : "",
+    outgoingText,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
   lead = await appendConversation(lead.leadId, [
-    { role: "assistant", content: text },
+    { role: "assistant", content: historyText },
   ]);
 
   if (instruction) {
@@ -198,35 +320,88 @@ async function deliverToClient({ phone, text, instruction }) {
   return lead;
 }
 
-export async function handleManagerMessage({ message, senderChatId }) {
+export async function handleManagerMessage({ message, media = [], senderChatId }) {
   if (senderChatId && !isManagerPhone(senderChatId)) {
     log("MANAGER", { rejected: true, sender: senderChatId });
     return { ok: false, error: "not_manager" };
   }
 
-  log("MANAGER", { message: String(message || "").slice(0, 300) });
+  const incomingFiles = normalizePendingFiles(media);
+  log("MANAGER", {
+    message: String(message || "").slice(0, 300),
+    files: incomingFiles.map((file) => file.fileName),
+  });
   const notify = (text) => notifyManagerRaw(text, senderChatId);
 
   const pending = await getPendingOutbound();
+
+  if (incomingFiles.length) {
+    const phone = extractPhoneCandidate(message) || pending?.phone || "";
+    const caption = fileCaptionFromMessage(message) || pending?.fileCaption || "";
+    const files = incomingFiles.map((file, index) => ({
+      ...file,
+      caption: index === 0 ? caption : "",
+    }));
+    await setPendingOutbound({
+      phone,
+      draft: pending?.draft || "",
+      instruction: pending?.instruction || message,
+      fileCaption: caption,
+      files,
+    });
+    if (!phone) {
+      await notify("Файл принят. Укажите номер клиента, например: +77082555595");
+      return { ok: true, kind: "need_phone" };
+    }
+    await notify(
+      draftPreviewText({
+        phone,
+        draft: pending?.draft || "",
+        instruction: pending?.instruction || "",
+        files,
+        fileCaption: caption,
+      }),
+    );
+    return { ok: true, kind: "preview", phone };
+  }
+
+  if (isCancelSend(message) && hasPendingContent(pending)) {
+    await clearPendingOutbound();
+    await notify("Отправка отменена. Клиенту ничего не ушло.");
+    return { ok: true, kind: "cancelled" };
+  }
+
+  if (isConfirmSend(message) && pending?.files?.length && !pending?.phone) {
+    await notify("Файл принят. Укажите номер клиента, например: +77082555595");
+    return { ok: true, kind: "need_phone" };
+  }
+
   if (isConfirmSend(message) && pending?.phone) {
     try {
-      const text =
-        pending.draft ||
-        (await composeClientMessage({
+      const files = normalizePendingFiles(pending.files);
+      let text = pending.draft || "";
+      if (!text && !files.length) {
+        text = await composeClientMessage({
           lead: (await getLeadByPhone(pending.phone)) || { clientPhone: pending.phone },
           instruction: pending.instruction || "Напиши клиенту короткое первое сообщение и уточни детали заявки.",
-        }));
+        });
+      }
       const lead = await deliverToClient({
         phone: pending.phone,
         text,
         instruction: pending.instruction,
+        files,
+        fileCaption: pending.fileCaption,
       });
       await notify(
         confirmationText({
           lead,
-          actions: [{ type: "AI_COMPOSE", value: pending.instruction }],
+          actions: files.length
+            ? [{ type: "WAIT_FILE", value: pending.phone }]
+            : [{ type: "AI_COMPOSE", value: pending.instruction }],
           sentText: text,
           sentPhone: pending.phone,
+          sentFiles: files,
         }),
       );
       return { ok: true, sent: true, leadId: lead.leadId };
@@ -249,7 +424,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
   if (
     parsed.phone &&
     !actions.some((item) =>
-      ["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"].includes(item.type),
+      ["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT", "WAIT_FILE"].includes(item.type),
     ) &&
     /узнай|уточни|подробност|заявк|напиши|скажи|предложи|свяжись|отправь|напомин/i.test(message)
   ) {
@@ -279,40 +454,63 @@ export async function handleManagerMessage({ message, senderChatId }) {
     return { ok: last.ok, kind: "last_send" };
   }
 
+  if (actions.some((item) => item.type === "WAIT_FILE")) {
+    const phone = parsed.phone || pending?.phone;
+    if (!phone) {
+      await notify("Укажите номер клиента и пришлите фото или файл.");
+      return { ok: false };
+    }
+    const caption = fileCaptionFromMessage(message) || pending?.fileCaption || "";
+    await setPendingOutbound({
+      phone,
+      draft: pending?.draft || "",
+      instruction: pending?.instruction || "",
+      fileCaption: caption,
+      files: pending?.files || [],
+    });
+    if (pending?.files?.length) {
+      await notify(
+        draftPreviewText({
+          phone,
+          draft: pending.draft,
+          instruction: pending.instruction,
+          files: pending.files,
+          fileCaption: caption,
+        }),
+      );
+      return { ok: true, kind: "preview", phone };
+    }
+    await notify(
+      `Номер принят: ${formatPhoneDisplay(phone)}\n\nПришлите фото или файл, который нужно отправить клиенту.`,
+    );
+    return { ok: true, kind: "wait_file", phone };
+  }
+
   if (actions.some((item) => item.type === "SEND_HERE") && parsed.phone) {
     const draft = await getPendingOutbound();
-    if (draft?.draft) {
-      try {
-        const lead = await deliverToClient({
+    if (draft?.draft || draft?.files?.length) {
+      await setPendingOutbound({
+        phone: parsed.phone,
+        draft: draft.draft,
+        instruction: draft.instruction,
+        fileCaption: draft.fileCaption,
+        files: draft.files,
+      });
+      await notify(
+        draftPreviewText({
           phone: parsed.phone,
-          text: draft.draft,
+          draft: draft.draft,
           instruction: draft.instruction,
-        });
-        await notify(
-          confirmationText({
-            lead,
-            actions: [{ type: "AI_COMPOSE", value: draft.instruction }],
-            sentText: draft.draft,
-            sentPhone: parsed.phone,
-          }),
-        );
-        return { ok: true, sent: true, leadId: lead.leadId };
-      } catch (error) {
-        await notify(
-          [
-            "❌ Не удалось отправить сообщение",
-            "",
-            `Номер: ${formatPhoneDisplay(parsed.phone)}`,
-            `Причина: ${error.message}`,
-          ].join("\n"),
-        );
-        return { ok: false, error: error.message };
-      }
+          files: draft.files,
+          fileCaption: draft.fileCaption,
+        }),
+      );
+      return { ok: true, kind: "preview" };
     }
 
     await setPendingOutbound({ phone: parsed.phone, draft: "", instruction: "" });
     await notify(
-      `Номер принят: ${formatPhoneDisplay(parsed.phone)}\n\nНапишите, что отправить. Например:\n${parsed.phone} напомни про запуск проекта`,
+      `Номер принят: ${formatPhoneDisplay(parsed.phone)}\n\nНапишите, что отправить, или пришлите фото/файл.`,
     );
     return { ok: true, kind: "target" };
   }
@@ -320,9 +518,10 @@ export async function handleManagerMessage({ message, senderChatId }) {
   const needsSend = actions.some((item) =>
     ["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"].includes(item.type),
   );
+  const commandPhone = parsed.phone || (needsSend && pending?.phone ? pending.phone : null);
   let lead = await resolveLead({
     leadId: parsed.leadId,
-    phone: parsed.phone,
+    phone: commandPhone,
     createIfMissing: false,
   });
 
@@ -335,14 +534,14 @@ export async function handleManagerMessage({ message, senderChatId }) {
     return { ok: true, kind: "status", leadId: lead.leadId };
   }
 
-  if (!lead && !parsed.phone && !parsed.leadId) {
+  if (!lead && !commandPhone && !parsed.leadId) {
     await notify(
       "Не понял, к какому клиенту относится команда. Достаточно указать номер телефона.",
     );
     return { ok: false };
   }
 
-  if (!lead && parsed.leadId && !parsed.phone) {
+  if (!lead && parsed.leadId && !commandPhone) {
     await notify(`❌ ${parsed.leadId} не найден.`);
     return { ok: false };
   }
@@ -352,8 +551,8 @@ export async function handleManagerMessage({ message, senderChatId }) {
   for (const action of actions) {
     if (action.type === "SET_MODE") {
       const mode = String(action.value || "AUTO").toUpperCase();
-      if (!lead && parsed.phone) {
-        lead = await getOrCreateLeadByPhone(parsed.phone, {
+      if (!lead && commandPhone) {
+        lead = await getOrCreateLeadByPhone(commandPhone, {
           source: "manager_outbound",
           direction: "outbound",
         });
@@ -372,9 +571,9 @@ export async function handleManagerMessage({ message, senderChatId }) {
       log("MODE CHANGE", { leadId: lead.leadId, aiMode: mode });
     }
 
-    if (action.type === "SET_MIN_PRICE" && (lead || parsed.phone)) {
+    if (action.type === "SET_MIN_PRICE" && (lead || commandPhone)) {
       if (!lead) {
-        lead = await getOrCreateLeadByPhone(parsed.phone, {
+        lead = await getOrCreateLeadByPhone(commandPhone, {
           source: "manager_outbound",
           direction: "outbound",
         });
@@ -386,9 +585,9 @@ export async function handleManagerMessage({ message, senderChatId }) {
       });
     }
 
-    if (action.type === "SET_GOAL" && (lead || parsed.phone)) {
+    if (action.type === "SET_GOAL" && (lead || commandPhone)) {
       if (!lead) {
-        lead = await getOrCreateLeadByPhone(parsed.phone, {
+        lead = await getOrCreateLeadByPhone(commandPhone, {
           source: "manager_outbound",
           direction: "outbound",
         });
@@ -400,9 +599,9 @@ export async function handleManagerMessage({ message, senderChatId }) {
       });
     }
 
-    if (action.type === "ADD_INSTRUCTION" && (lead || parsed.phone)) {
+    if (action.type === "ADD_INSTRUCTION" && (lead || commandPhone)) {
       if (!lead) {
-        lead = await getOrCreateLeadByPhone(parsed.phone, {
+        lead = await getOrCreateLeadByPhone(commandPhone, {
           source: "manager_outbound",
           direction: "outbound",
         });
@@ -415,7 +614,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
     }
 
     if (["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"].includes(action.type)) {
-      const targetPhone = lead?.clientPhone || parsed.phone;
+      const targetPhone = lead?.clientPhone || commandPhone;
       if (!targetPhone) {
         await notify("❌ Не указан номер клиента для отправки.");
         return { ok: false };
@@ -444,17 +643,24 @@ export async function handleManagerMessage({ message, senderChatId }) {
           phone: targetPhone,
           draft: sentText,
           instruction,
+          fileCaption: pending?.fileCaption || "",
+          files: pending?.files || [],
         });
 
-        lead = await deliverToClient({
-          phone: targetPhone,
-          text: sentText,
-          instruction: action.type === "EXACT_MESSAGE" ? "" : instruction,
-        });
+        await notify(
+          draftPreviewText({
+            phone: targetPhone,
+            draft: sentText,
+            instruction,
+            files: pending?.files || [],
+            fileCaption: pending?.fileCaption || "",
+          }),
+        );
+        return { ok: true, kind: "preview", phone: targetPhone };
       } catch (error) {
         await notify(
           [
-            "❌ Не удалось отправить сообщение",
+            "❌ Не удалось подготовить сообщение",
             "",
             `Номер: ${formatPhoneDisplay(targetPhone)}`,
             `Причина: ${error.message}`,
@@ -485,7 +691,7 @@ export async function handleManagerMessage({ message, senderChatId }) {
         lead,
         actions: actions.length ? actions : [{ type: "ADD_INSTRUCTION", value: message }],
         sentText,
-        sentPhone: parsed.phone,
+        sentPhone: commandPhone,
       }),
     );
   } catch (error) {

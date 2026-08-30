@@ -36,9 +36,11 @@ async function persist() {
 export async function setPendingOutbound(payload) {
   await ensureLoaded();
   pendingOutbound = {
-    phone: payload.phone,
+    phone: payload.phone || "",
     draft: payload.draft || "",
     instruction: payload.instruction || "",
+    fileCaption: payload.fileCaption || "",
+    files: Array.isArray(payload.files) ? payload.files : [],
     createdAt: Date.now(),
   };
   await persist();

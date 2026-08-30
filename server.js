@@ -357,6 +357,35 @@ async function extractIncomingText(body) {
   return parts.filter(Boolean).join("\n").trim();
 }
 
+const FORWARDABLE_MEDIA = new Set([
+  "imageMessage",
+  "videoMessage",
+  "documentMessage",
+  "stickerMessage",
+]);
+
+function extractIncomingMedia(body) {
+  const typeMessage = body?.messageData?.typeMessage;
+  if (!FORWARDABLE_MEDIA.has(typeMessage)) {
+    return null;
+  }
+
+  const file = body.messageData?.fileMessageData || {};
+  if (!file.downloadUrl && !body.idMessage) {
+    return null;
+  }
+
+  return {
+    type: typeMessage,
+    url: file.downloadUrl || "",
+    fileName: file.fileName || "",
+    mimeType: file.mimeType || "",
+    caption: file.caption || "",
+    idMessage: body.idMessage || "",
+    chatIdFrom: body.senderData?.chatId || "",
+  };
+}
+
 async function flushPendingChat(sessionId, chatId) {
   const pending = pendingMessages.get(sessionId);
   if (!pending || pending.generating) {
@@ -374,6 +403,7 @@ async function flushPendingChat(sessionId, chatId) {
     if (isManagerPhone(chatId)) {
       await handleManagerMessage({
         message: combinedMessage,
+        media: pending.media || [],
         senderChatId: chatId,
       });
     } else {
@@ -420,13 +450,19 @@ app.post("/webhook", async (req, res) => {
     const senderName =
       body.senderData?.senderName || body.senderData?.chatName || "";
     const message = await extractIncomingText(body);
+    const media = extractIncomingMedia(body);
+    const isManager = isManagerPhone(chatId);
 
-    if (!chatId || !message) {
+    if (!chatId || (!message && !media)) {
       return res.json({ success: true, skipped: "no text message" });
     }
 
-    const role = isManagerPhone(chatId) ? "MANAGER" : "CLIENT";
-    log(role, { phone: phoneFromChatId(chatId), buffered: true });
+    if (!isManager && !message) {
+      return res.json({ success: true, skipped: "no text message" });
+    }
+
+    const role = isManager ? "MANAGER" : "CLIENT";
+    log(role, { phone: phoneFromChatId(chatId), buffered: true, hasFile: Boolean(media) });
 
     const sessionId = chatId;
     const existing = pendingMessages.get(sessionId);
@@ -437,12 +473,18 @@ app.post("/webhook", async (req, res) => {
 
     const pending = existing || {
       messages: [],
+      media: [],
       version: 0,
       generating: false,
       timer: null,
     };
 
-    pending.messages = [...pending.messages, message.trim()];
+    if (message.trim()) {
+      pending.messages = [...pending.messages, message.trim()];
+    }
+    if (media) {
+      pending.media = [...(pending.media || []), media];
+    }
     pending.version += 1;
     pending.senderName = pending.senderName || senderName;
 

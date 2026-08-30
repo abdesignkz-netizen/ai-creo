@@ -55,19 +55,14 @@ export function assertGreenApiSent(data, httpStatus) {
   throw new Error(formatGreenApiFailure(data, httpStatus));
 }
 
-export async function sendWhatsAppMessage(chatId, message) {
+async function postGreenApi(path, payload) {
   const { apiToken, base } = getGreenApiBase();
-  const url = `${base}/sendMessage/${apiToken}`;
-
-  const response = await fetch(url, {
+  const response = await fetch(`${base}/${path}/${apiToken}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      chatId,
-      message,
-    }),
+    body: JSON.stringify(payload),
   });
 
   const raw = await response.text();
@@ -79,14 +74,90 @@ export async function sendWhatsAppMessage(chatId, message) {
   }
 
   if (!response.ok || response.status === 466) {
-    log("GREEN API ERROR", { chatId, status: response.status });
+    log("GREEN API ERROR", { path, status: response.status });
     throw new Error(formatGreenApiFailure(data, response.status));
   }
 
+  return { data, status: response.status };
+}
+
+export function inferFileName(file = {}) {
+  const named = String(file.fileName || "").trim();
+  if (named && /\.[a-z0-9]{2,8}$/i.test(named)) {
+    return named;
+  }
+
+  const mime = String(file.mimeType || "").toLowerCase();
+  const byMime = {
+    "image/jpeg": "photo.jpg",
+    "image/jpg": "photo.jpg",
+    "image/png": "photo.png",
+    "image/webp": "photo.webp",
+    "image/gif": "photo.gif",
+    "video/mp4": "video.mp4",
+    "video/3gpp": "video.3gp",
+    "application/pdf": "document.pdf",
+    "application/msword": "document.doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "document.docx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "presentation.pptx",
+    "application/vnd.ms-powerpoint": "presentation.ppt",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "table.xlsx",
+  };
+
+  if (byMime[mime]) {
+    return byMime[mime];
+  }
+  if (file.type === "imageMessage" || file.type === "stickerMessage") {
+    return "photo.jpg";
+  }
+  if (file.type === "videoMessage") {
+    return "video.mp4";
+  }
+  return named || "file.bin";
+}
+
+export async function downloadWhatsAppFileUrl(chatId, idMessage) {
+  const { data } = await postGreenApi("downloadFile", { chatId, idMessage });
+  if (!data?.downloadUrl) {
+    throw new Error("Green API не вернул ссылку на файл");
+  }
+  return data.downloadUrl;
+}
+
+export async function sendWhatsAppFile(chatId, file) {
+  let urlFile = file?.url || "";
+  if (!urlFile && file?.idMessage && file?.chatIdFrom) {
+    urlFile = await downloadWhatsAppFileUrl(file.chatIdFrom, file.idMessage);
+  }
+  if (!urlFile) {
+    throw new Error("Нет ссылки на файл для отправки");
+  }
+
+  const { data, status } = await postGreenApi("sendFileByUrl", {
+    chatId,
+    urlFile,
+    fileName: inferFileName(file),
+    caption: file?.caption || "",
+  });
+
   try {
-    return assertGreenApiSent(data, response.status);
+    return assertGreenApiSent(data, status);
   } catch (error) {
-    log("GREEN API ERROR", { chatId, status: response.status, quota: true });
+    log("GREEN API ERROR", { chatId, path: "sendFileByUrl", quota: true });
+    throw error;
+  }
+}
+
+export async function sendWhatsAppMessage(chatId, message) {
+  const { data, status } = await postGreenApi("sendMessage", {
+    chatId,
+    message,
+  });
+
+  try {
+    return assertGreenApiSent(data, status);
+  } catch (error) {
+    log("GREEN API ERROR", { chatId, path: "sendMessage", quota: true });
     throw error;
   }
 }

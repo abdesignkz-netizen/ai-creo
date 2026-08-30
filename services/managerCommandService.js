@@ -93,8 +93,17 @@ function parseByRules(message) {
     actions.push({ type: "SEND_HERE", value: phone, text: null });
   }
 
+  const fileHint =
+    /(отправь|перешли|направь).{0,60}(файл|фото|документ|пдф|картинк)|прикрепи|вот (файл|фото|документ)/i.test(
+      text,
+    );
+  if (fileHint) {
+    actions.push({ type: "WAIT_FILE", value: phone, text: null });
+  }
+
   const composeHint =
     !exact &&
+    !fileHint &&
     /(скажи|объясни|предложи|уточни|узнай|напомин|нвпомин|попробуй|сделай акцент|отправь|закрой|доведи|подробност|заявк|напиши|свяжись|на этот номер|на указанный)/i.test(
       text,
     );
@@ -119,7 +128,7 @@ function rulesAreComplete(parsed) {
   if (types.has("LIST_LEADS") || types.has("LAST_SEND_STATUS")) {
     return true;
   }
-  if (types.has("SEND_HERE") && parsed.phone) {
+  if ((types.has("SEND_HERE") || types.has("WAIT_FILE")) && parsed.phone) {
     return true;
   }
   if (types.has("STATUS_QUERY") && (parsed.phone || parsed.leadId)) {
@@ -184,7 +193,12 @@ const COMMAND_HINT_RE =
   /отправь|напиши|скажи|узнай|уточни|предложи|напомни|подробност|заявк|свяжись|остановись|продолжай|ниже|скидк|что с|активные лиды|покажи лиды/i;
 
 const CONFIRM_SEND_RE =
-  /(отправь|перешли|направь).*(номер|туда|клиенту|не сюда|это сообщение)|^(да[,.]?\s*)(отправь|перешли)?$/i;
+  /^(да|ок|можно|подтверждаю)([,!.\s]+(отправь|перешли|направь|это|его|сообщение|клиенту|пожалуйста)*)*[.!]?\s*$/i;
+
+const CONFIRM_SEND_SHORT_RE =
+  /^(отправь|перешли|направь)(\s+(это|его|сообщение|номер|туда|клиенту|пожалуйста))*[.!]?\s*$/i;
+
+const CANCEL_SEND_RE = /^(нет|не надо|отмена|отмени|стоп)([,!.\s]+(отправь|не надо|отмена|пожалуйста)*)*[.!]?\s*$/i;
 
 export function looksLikeManagerCommand(message, senderPhone) {
   const text = String(message || "").trim();
@@ -192,14 +206,22 @@ export function looksLikeManagerCommand(message, senderPhone) {
   if (target && target !== normalizePhone(senderPhone) && COMMAND_HINT_RE.test(text)) {
     return true;
   }
-  if (CONFIRM_SEND_RE.test(text)) {
+  if (CONFIRM_SEND_RE.test(text) || CONFIRM_SEND_SHORT_RE.test(text)) {
     return true;
   }
   return /активные лиды|покажи лиды/i.test(text);
 }
 
 export function isConfirmSend(message) {
-  return CONFIRM_SEND_RE.test(String(message || "").trim());
+  const text = String(message || "").trim();
+  if (extractPhoneCandidate(text) && stripPhoneFromText(text).length > 8) {
+    return false;
+  }
+  return CONFIRM_SEND_RE.test(text) || CONFIRM_SEND_SHORT_RE.test(text);
+}
+
+export function isCancelSend(message) {
+  return CANCEL_SEND_RE.test(String(message || "").trim());
 }
 
 export function describeActions(actions) {
@@ -234,6 +256,9 @@ export function describeActions(actions) {
       }
       if (action.type === "SEND_HERE") {
         return `Отправить на ${action.value}`;
+      }
+      if (action.type === "WAIT_FILE") {
+        return "Ожидаем фото или файл для клиента";
       }
       return action.type;
     })
