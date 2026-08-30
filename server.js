@@ -2,17 +2,17 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
-import OpenAI from "openai";
-import { readFile, writeFile, unlink } from "fs/promises";
+import { writeFile, unlink } from "fs/promises";
 import { createReadStream } from "fs";
 import os from "os";
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { join } from "path";
+import { generateAiReply, getOpenAIClient } from "./services/aiService.js";
+import { handleClientMessage } from "./services/clientService.js";
+import { handleManagerMessage } from "./services/managerService.js";
+import { isManagerPhone, phoneFromChatId } from "./services/phoneService.js";
+import { log } from "./services/logger.js";
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
 
 const app = express();
 
@@ -22,7 +22,7 @@ const ALLOWED_ORIGINS = [
   "http://localhost:4173",
   "https://creolab.kz",
   "https://www.creolab.kz",
-  "https://site.creolab.kz", // Netlify / кастомный домен — при смене URL обновите или задайте FRONTEND_ORIGIN
+  "https://site.creolab.kz",
   process.env.FRONTEND_ORIGIN,
 ].filter(Boolean);
 
@@ -50,21 +50,8 @@ app.use(express.json({ type: "application/json", limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
-const sessions = new Map();
-const MAX_HISTORY_MESSAGES = Number(process.env.MAX_HISTORY_MESSAGES || 24);
 const pendingMessages = new Map();
 const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 800);
-const OPENAI_REASONING_EFFORT = process.env.OPENAI_REASONING_EFFORT || "low";
-let cachedPromptFiles = null;
-let openaiClient = null;
-const FALLBACK_RESULT = {
-  reply: "Не смог корректно обработать ответ. Передам менеджеру.",
-  lead_status: "warm",
-  service: "unknown",
-  handoff: true,
-  summary: "AI вернул некорректный JSON, нужна ручная проверка.",
-  parse_error: true,
-};
 
 function validateEnv() {
   if (!process.env.OPENAI_API_KEY) {
@@ -199,76 +186,6 @@ function buildLeadTelegramMessage({
   return lines.join("\n").slice(0, 4000);
 }
 
-function getOpenAIClient() {
-  if (!openaiClient) {
-    openaiClient = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-  }
-
-  return openaiClient;
-}
-
-async function loadPromptFiles() {
-  if (cachedPromptFiles) {
-    return cachedPromptFiles;
-  }
-
-  const systemPromptPath = join(__dirname, "prompts", "system_prompt.txt");
-  const knowledgePath = join(__dirname, "knowledge", "creolab_knowledge_base.txt");
-
-  const [systemPrompt, knowledgeBase] = await Promise.all([
-    readFile(systemPromptPath, "utf-8"),
-    readFile(knowledgePath, "utf-8"),
-  ]);
-
-  cachedPromptFiles = { systemPrompt, knowledgeBase };
-  return cachedPromptFiles;
-}
-
-function formatHistory(history) {
-  if (!Array.isArray(history) || history.length === 0) {
-    return "История диалога пуста.";
-  }
-
-  return history
-    .map((item, index) => {
-      const role = item.role || "unknown";
-      const content = item.content || "";
-      return `${index + 1}. [${role}]: ${content}`;
-    })
-    .join("\n");
-}
-
-function buildAiInput({ knowledgeBase, history, message }) {
-  return [
-    "=== БАЗА ЗНАНИЙ ===",
-    knowledgeBase.trim(),
-    "",
-    "=== ИСТОРИЯ ДИАЛОГА ===",
-    formatHistory(history),
-    "",
-    "=== ПОСЛЕДНЕЕ СООБЩЕНИЕ КЛИЕНТА ===",
-    message,
-    "",
-    "Ответь строго JSON без markdown и без пояснений вне JSON.",
-  ].join("\n");
-}
-
-function extractJsonFromText(text) {
-  const trimmed = text.trim();
-
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      return JSON.parse(jsonMatch[0]);
-    }
-    throw new Error("JSON not found");
-  }
-}
-
 app.get("/", (_req, res) => {
   res.json({
     status: "ok",
@@ -348,7 +265,7 @@ app.post("/test-ai", async (req, res) => {
     });
   }
 
-  const { message, sessionId = "test-user" } = req.body || {};
+  const { message, sessionId = "test-user", history = [] } = req.body || {};
 
   if (!message || typeof message !== "string" || !message.trim()) {
     return res.status(400).json({
@@ -358,11 +275,11 @@ app.post("/test-ai", async (req, res) => {
   }
 
   try {
-    const { raw, result, latencyMs, nextHistory } = await generateAiReply({
-      sessionId,
+    const { raw, result, latencyMs } = await generateAiReply({
       message: message.trim(),
+      history,
+      lead: { leadId: sessionId, aiMode: "AUTO", status: "new" },
     });
-    commitAiHistory(sessionId, nextHistory);
 
     return res.json({
       success: true,
@@ -379,92 +296,6 @@ app.post("/test-ai", async (req, res) => {
   }
 });
 
-async function sendWhatsAppMessage(chatId, message) {
-  const idInstance = process.env.GREEN_API_INSTANCE_ID;
-  const apiToken = process.env.GREEN_API_TOKEN;
-
-  const url = `https://7107.api.greenapi.com/waInstance${idInstance}/sendMessage/${apiToken}`;
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      chatId,
-      message,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Green API sendMessage error: ${errorText}`);
-  }
-
-  return response.json();
-}
-
-
-async function generateAiReply({ sessionId, message }) {
-  const history = sessions.get(sessionId) || [];
-  const { systemPrompt, knowledgeBase } = await loadPromptFiles();
-
-  const input = buildAiInput({
-    knowledgeBase,
-    history,
-    message: message.trim(),
-  });
-
-  const startedAt = Date.now();
-  const response = await getOpenAIClient().responses.create({
-    model: process.env.OPENAI_MODEL,
-    instructions: systemPrompt,
-    reasoning: {
-      effort: OPENAI_REASONING_EFFORT,
-    },
-    input: [
-      {
-        role: "user",
-        content: input,
-      },
-    ],
-  });
-  const latencyMs = Date.now() - startedAt;
-
-  const raw = response.output_text || "";
-
-  let result;
-  try {
-    result = extractJsonFromText(raw);
-  } catch {
-    result = { ...FALLBACK_RESULT };
-  }
-
-  const reply = result.reply || "Понял. Давайте уточним детали.";
-
-  const updatedHistory = [
-    ...history,
-    { role: "user", content: message.trim() },
-    { role: "assistant", content: reply },
-  ].slice(-MAX_HISTORY_MESSAGES);
-
-  console.log("AI_REPLY", {
-    sessionId,
-    latencyMs,
-    model: process.env.OPENAI_MODEL,
-    reasoningEffort: OPENAI_REASONING_EFFORT,
-    inputChars: input.length,
-    historyMessages: history.length,
-  });
-
-  return { reply, result, raw, latencyMs, nextHistory: updatedHistory };
-}
-
-function commitAiHistory(sessionId, nextHistory) {
-  if (nextHistory) {
-    sessions.set(sessionId, nextHistory);
-  }
-}
 async function transcribeAudioFromUrl(fileUrl) {
   const response = await fetch(fileUrl);
 
@@ -502,36 +333,12 @@ async function extractIncomingText(body) {
 
   if (typeMessage === "audioMessage") {
     const fileUrl = body.messageData?.fileMessageData?.downloadUrl;
-
     if (!fileUrl) return "";
-
     const text = await transcribeAudioFromUrl(fileUrl);
     return text ? `[Голосовое сообщение]: ${text}` : "";
   }
 
   return "";
-}
-
-async function sendHandoffIfNeeded(chatId, result) {
-  if (result?.handoff !== true) {
-    return;
-  }
-
-  const phone = chatId.replace("@c.us", "");
-  const leadMessage = `
-🔥 Новый горячий лид
-
-Телефон:
-+${phone}
-
-Услуга:
-${result.service || "не указана"}
-
-Резюме:
-${result.summary || "нет резюме"}
-`;
-
-  await sendWhatsAppMessage("77077471301@c.us", leadMessage);
 }
 
 async function flushPendingChat(sessionId, chatId) {
@@ -547,31 +354,31 @@ async function flushPendingChat(sessionId, chatId) {
   const combinedMessage = pending.messages.join("\n");
   const startedAt = Date.now();
 
-  const { reply, result, latencyMs, nextHistory } = await generateAiReply({
-    sessionId,
-    message: combinedMessage,
-  });
-
-  const current = pendingMessages.get(sessionId);
-  if (!current) {
-    return;
+  try {
+    if (isManagerPhone(chatId)) {
+      await handleManagerMessage({
+        message: combinedMessage,
+      });
+    } else {
+      await handleClientMessage({
+        chatId,
+        message: combinedMessage,
+        senderName: pending.senderName,
+      });
+    }
+  } finally {
+    const latest = pendingMessages.get(sessionId);
+    if (latest && latest.version !== version) {
+      latest.generating = false;
+      return flushPendingChat(sessionId, chatId);
+    }
+    pendingMessages.delete(sessionId);
   }
 
-  if (current.version !== version) {
-    current.generating = false;
-    console.log("AI_REPLY_UPDATED", { chatId, version, nextVersion: current.version });
-    return flushPendingChat(sessionId, chatId);
-  }
-
-  commitAiHistory(sessionId, nextHistory);
-  await sendWhatsAppMessage(chatId, reply);
-  await sendHandoffIfNeeded(chatId, result);
-  pendingMessages.delete(sessionId);
-
-  console.log("WHATSAPP_REPLY", {
+  log("AI RESPONSE", {
     chatId,
+    role: isManagerPhone(chatId) ? "MANAGER" : "CLIENT",
     bufferMs: MESSAGE_BUFFER_MS,
-    aiMs: latencyMs,
     totalMs: Date.now() - startedAt + MESSAGE_BUFFER_MS,
   });
 }
@@ -585,21 +392,24 @@ app.post("/webhook", async (req, res) => {
       "TYPE:",
       body.typeWebhook,
       "CHAT:",
-      body.senderData?.chatId
+      body.senderData?.chatId,
     );
-
-    console.log("GREEN API WEBHOOK:", JSON.stringify(body, null, 2));
 
     if (body.typeWebhook !== "incomingMessageReceived") {
       return res.json({ success: true, skipped: "not incoming message" });
     }
 
     const chatId = body.senderData?.chatId;
+    const senderName =
+      body.senderData?.senderName || body.senderData?.chatName || "";
     const message = await extractIncomingText(body);
 
     if (!chatId || !message) {
       return res.json({ success: true, skipped: "no text message" });
     }
+
+    const role = isManagerPhone(chatId) ? "MANAGER" : "CLIENT";
+    log(role, { phone: phoneFromChatId(chatId), buffered: true });
 
     const sessionId = chatId;
     const existing = pendingMessages.get(sessionId);
@@ -617,6 +427,7 @@ app.post("/webhook", async (req, res) => {
 
     pending.messages = [...pending.messages, message.trim()];
     pending.version += 1;
+    pending.senderName = pending.senderName || senderName;
 
     if (!pending.generating) {
       pending.timer = setTimeout(() => {
@@ -632,10 +443,9 @@ app.post("/webhook", async (req, res) => {
     return res.json({
       success: true,
       buffered: true,
+      role,
       messagesCount: pending.messages.length,
     });
-
-
   } catch (error) {
     console.error("WEBHOOK ERROR:", error);
 
@@ -645,7 +455,6 @@ app.post("/webhook", async (req, res) => {
     });
   }
 });
-
 
 app.listen(PORT, () => {
   console.log(`CREOLAB WhatsApp AI Sales Manager running on http://localhost:${PORT}`);
