@@ -6,7 +6,12 @@ import { writeFile, unlink } from "fs/promises";
 import { createReadStream } from "fs";
 import os from "os";
 import { join } from "path";
-import { generateAiReply, getOpenAIClient } from "./services/aiService.js";
+import {
+  generateAiReply,
+  getAiModel,
+  getTranscriptionClient,
+  isAnyModelProvider,
+} from "./services/aiService.js";
 import { handleClientMessage, buildClientMessageWithMedia } from "./services/clientService.js";
 import { handleFailedOutboundStatus, handleManagerMessage } from "./services/managerService.js";
 import { noteOutgoingStatus } from "./services/whatsappService.js";
@@ -62,6 +67,16 @@ const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 4000);
 const FOLLOWUP_BUFFER_MS = Math.max(1500, Math.round(MESSAGE_BUFFER_MS / 2));
 
 function validateEnv() {
+  if (isAnyModelProvider()) {
+    if (!process.env.ANYMODEL_API_KEY) {
+      return "ANYMODEL_API_KEY не задан. Скопируйте .env.example в .env и укажите ключ AnyModel.";
+    }
+    if (!process.env.ANYMODEL_MODEL) {
+      return "ANYMODEL_MODEL не задан. Скопируйте .env.example в .env и укажите модель AnyModel.";
+    }
+    return null;
+  }
+
   if (!process.env.OPENAI_API_KEY) {
     return "OPENAI_API_KEY не задан. Скопируйте .env.example в .env и укажите ключ OpenAI.";
   }
@@ -317,7 +332,7 @@ async function transcribeAudioFromUrl(fileUrl) {
   await writeFile(tempFilePath, buffer);
 
   try {
-    const transcription = await getOpenAIClient().audio.transcriptions.create({
+    const transcription = await getTranscriptionClient().audio.transcriptions.create({
       file: createReadStream(tempFilePath),
       model: "whisper-1",
     });
@@ -597,5 +612,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.listen(PORT, () => {
+  const provider = isAnyModelProvider() ? "anymodel" : "openai";
   console.log(`CREOLAB WhatsApp AI Sales Manager running on http://localhost:${PORT}`);
+  console.log(`AI provider: ${provider}, model: ${getAiModel() || "not set"}`);
 });

@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_ANYMODEL_BASE_URL = "https://anymodel.org/v1";
 const OPENAI_REASONING_EFFORT = process.env.OPENAI_REASONING_EFFORT || "low";
 const MAX_HISTORY_MESSAGES = Number(process.env.MAX_HISTORY_MESSAGES || 40);
 
@@ -21,13 +22,46 @@ const FALLBACK_RESULT = {
 let openaiClient = null;
 let cachedPromptFiles = null;
 
+export function isAnyModelProvider() {
+  return String(process.env.AI_PROVIDER || "").trim().toLowerCase() === "anymodel";
+}
+
+export function getAiModel() {
+  if (isAnyModelProvider()) {
+    return process.env.ANYMODEL_MODEL;
+  }
+
+  return process.env.OPENAI_MODEL;
+}
+
+function reasoningOptions(effort = OPENAI_REASONING_EFFORT) {
+  if (isAnyModelProvider()) {
+    return {};
+  }
+
+  return { reasoning: { effort } };
+}
+
 export function getOpenAIClient() {
   if (!openaiClient) {
-    openaiClient = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
+    if (isAnyModelProvider()) {
+      openaiClient = new OpenAI({
+        apiKey: process.env.ANYMODEL_API_KEY,
+        baseURL: process.env.ANYMODEL_BASE_URL || DEFAULT_ANYMODEL_BASE_URL,
+      });
+    } else {
+      openaiClient = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY,
+      });
+    }
   }
   return openaiClient;
+}
+
+export function getTranscriptionClient() {
+  return new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
 }
 
 export function extractJsonFromText(text) {
@@ -234,11 +268,9 @@ export async function generateAiReply({
 
   const startedAt = Date.now();
   const response = await getOpenAIClient().responses.create({
-    model: process.env.OPENAI_MODEL,
+    model: getAiModel(),
     instructions: systemPrompt,
-    reasoning: {
-      effort: OPENAI_REASONING_EFFORT,
-    },
+    ...reasoningOptions(),
     input: [
       {
         role: "user",
@@ -302,8 +334,8 @@ export async function composeClientMessage({ lead, instruction, extraContext = "
     .join("\n");
 
   const response = await getOpenAIClient().responses.create({
-    model: process.env.OPENAI_MODEL,
-    reasoning: { effort: "low" },
+    model: getAiModel(),
+    ...reasoningOptions("low"),
     input,
   });
 
@@ -332,8 +364,8 @@ export async function parseManagerCommandWithAi(message) {
   ].join("\n");
 
   const response = await getOpenAIClient().responses.create({
-    model: process.env.OPENAI_MODEL,
-    reasoning: { effort: "low" },
+    model: getAiModel(),
+    ...reasoningOptions("low"),
     input,
   });
 
