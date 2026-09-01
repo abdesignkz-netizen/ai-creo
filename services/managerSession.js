@@ -35,8 +35,16 @@ async function persist() {
 
 export async function setPendingOutbound(payload) {
   await ensureLoaded();
+  const phones = Array.isArray(payload.phones)
+    ? payload.phones.filter(Boolean)
+    : payload.phone
+      ? [payload.phone]
+      : [];
+
   pendingOutbound = {
-    phone: payload.phone || "",
+    kind: payload.kind || (phones.length > 1 ? "broadcast" : "single"),
+    phone: payload.phone || phones[0] || "",
+    phones,
     draft: payload.draft || "",
     instruction: payload.instruction || "",
     fileCaption: payload.fileCaption || "",

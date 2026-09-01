@@ -11,12 +11,15 @@ import {
   parseManagerCommand,
   describeActions,
   cleanComposeInstruction,
+  extractBroadcastText,
+  isBroadcastCommand,
   isCancelSend,
   isConfirmSend,
+  looksLikeManagerCommand,
 } from "./managerCommandService.js";
 import { composeClientMessage } from "./aiService.js";
 import { checkWhatsAppNumber, confirmOutgoingDelivery, inferFileName, sendWhatsAppFile, sendWhatsAppMessage } from "./whatsappService.js";
-import { extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, phoneFromChatId, stripPhoneFromText, toChatId } from "./phoneService.js";
+import { extractAllPhones, extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, phoneFromChatId, stripPhoneFromText, toChatId } from "./phoneService.js";
 import { notifyManagerRaw } from "./notificationService.js";
 import {
   clearPendingOutbound,
@@ -26,6 +29,11 @@ import {
   setPendingOutbound,
 } from "./managerSession.js";
 import { log } from "./logger.js";
+
+const BROADCAST_DELAY_MS = Number(process.env.BROADCAST_DELAY_MS || 1200);
+const BROADCAST_MAX_RECIPIENTS = Number(process.env.BROADCAST_MAX_RECIPIENTS || 40);
+
+let broadcastInFlight = false;
 
 function formatLeadSummary(lead) {
   const name = lead.clientName || "не выяснено";
@@ -155,8 +163,30 @@ function fileCaptionFromMessage(message) {
 
 function hasPendingContent(pending) {
   return Boolean(
-    pending && (pending.phone || pending.draft || pending.files?.length),
+    pending && (pending.phone || pending.phones?.length || pending.draft || pending.files?.length),
   );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function uniqueBroadcastPhones(values) {
+  return [...new Set((values || []).filter(Boolean))].filter((phone) => !isManagerPhone(phone));
+}
+
+function pendingPhones(pending) {
+  if (!pending) {
+    return [];
+  }
+  if (Array.isArray(pending.phones) && pending.phones.length) {
+    return uniqueBroadcastPhones(pending.phones);
+  }
+  return uniqueBroadcastPhones(pending.phone ? [pending.phone] : []);
+}
+
+function isBroadcastPending(pending) {
+  return Boolean(pending?.kind === "broadcast" || pendingPhones(pending).length > 1);
 }
 
 async function requireWhatsAppNumber(phone) {
@@ -248,6 +278,12 @@ async function sendToClient({ lead, text, phone, files = [] }) {
 }
 
 function dedupeActions(actions) {
+  if (actions.some((item) => item.type === "BROADCAST")) {
+    const other = actions.filter(
+      (item) => !["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT", "BROADCAST"].includes(item.type),
+    );
+    return [...other, actions.find((item) => item.type === "BROADCAST")];
+  }
   const sendTypes = new Set(["EXACT_MESSAGE", "AI_COMPOSE", "ASK_CLIENT"]);
   const other = actions.filter((item) => !sendTypes.has(item.type));
   const sends = actions.filter((item) => sendTypes.has(item.type));
@@ -258,6 +294,111 @@ function dedupeActions(actions) {
     return [...other, sends[0]];
   }
   return other;
+}
+
+function broadcastPreviewText({ phones, draft, files, fileCaption }) {
+  const fileLines = describeFiles(files);
+  const list = phones.map((phone, index) => `${index + 1}. ${formatPhoneDisplay(phone)}`).join("\n");
+  return [
+    `Рассылка на ${phones.length} ${phones.length === 1 ? "номер" : "номера"}`,
+    "",
+    list,
+    "",
+    fileLines.length ? `Вложение: ${fileLines.join(", ")}` : null,
+    fileLines.length && fileCaption ? `Подпись к файлу: «${fileCaption}»` : null,
+    draft ? `Текст:\n«${draft}»` : "Текст рассылки пока не указан.",
+    "",
+    draft
+      ? "Отправить всем этим номерам?"
+      : "Напишите текст рассылки, затем подтвердите.",
+    "Напишите: да / отправь",
+    "Или: нет / отмена",
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+}
+
+function formatBroadcastReport({ draft, sent, failed }) {
+  const lines = [
+    sent.length ? `✅ Рассылка: ушло ${sent.length}` : "❌ Рассылка: ничего не ушло",
+    "",
+    draft ? `Текст: «${String(draft).slice(0, 240)}»` : null,
+  ].filter((line) => line !== null);
+
+  if (sent.length) {
+    lines.push("", "Доставлено:", ...sent.map((phone) => `• ${formatPhoneDisplay(phone)}`));
+  }
+  if (failed.length) {
+    lines.push(
+      "",
+      "Не ушло:",
+      ...failed.map((item) => `• ${formatPhoneDisplay(item.phone)} — ${item.error}`),
+    );
+  }
+
+  return lines.join("\n");
+}
+
+async function deliverBroadcastToPhone({ phone, text, files, fileCaption }) {
+  const outgoingFiles = normalizePendingFiles(files).map((file, index) => ({
+    ...file,
+    caption: index === 0 ? file.caption || fileCaption || "" : "",
+  }));
+  const outgoingText = String(text || "").trim();
+  await sendToClient({ text: outgoingText, phone, files: outgoingFiles });
+
+  let lead = await getLeadByPhone(phone);
+  if (!lead) {
+    lead = await getOrCreateLeadByPhone(phone, {
+      source: "manager_broadcast",
+      direction: "outbound",
+    });
+  }
+
+  const historyText = [
+    outgoingFiles.length ? `[Файл: ${outgoingFiles.map((file) => file.fileName).join(", ")}]` : "",
+    outgoingText,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  await appendConversation(lead.leadId, [{ role: "assistant", content: historyText }]);
+  return lead;
+}
+
+async function executeBroadcast({ phones, draft, files, fileCaption }, notify) {
+  const sent = [];
+  const failed = [];
+
+  for (let index = 0; index < phones.length; index += 1) {
+    const phone = phones[index];
+    try {
+      await deliverBroadcastToPhone({
+        phone,
+        text: draft,
+        files,
+        fileCaption,
+      });
+      sent.push(phone);
+    } catch (error) {
+      failed.push({ phone, error: error.message });
+      log("BROADCAST ERROR", { phone, error: error.message });
+    }
+
+    if (index < phones.length - 1) {
+      await sleep(BROADCAST_DELAY_MS);
+    }
+  }
+
+  await setLastSend({
+    phone: sent[0] || failed[0]?.phone || "",
+    ok: failed.length === 0 && sent.length > 0,
+    text: `рассылка ${sent.length}/${phones.length}: ${draft}`,
+    error: failed.map((item) => `${item.phone}: ${item.error}`).join("; "),
+  });
+
+  await notify(formatBroadcastReport({ draft, sent, failed }));
+  return { sent, failed };
 }
 
 function draftPreviewText({ phone, draft, instruction, files, fileCaption }) {
@@ -368,19 +509,45 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
   const pending = await getPendingOutbound();
 
   if (incomingFiles.length) {
-    const phone = extractPhoneCandidate(message) || pending?.phone || "";
+    const messagePhones = uniqueBroadcastPhones(extractAllPhones(message));
+    const phones = messagePhones.length ? messagePhones : pendingPhones(pending);
     const caption = fileCaptionFromMessage(message) || pending?.fileCaption || "";
     const files = incomingFiles.map((file, index) => ({
       ...file,
       caption: index === 0 ? caption : "",
     }));
+    const kind =
+      phones.length > 1 || pending?.kind === "broadcast" || isBroadcastCommand(message)
+        ? "broadcast"
+        : "single";
+
     await setPendingOutbound({
-      phone,
+      kind,
+      phone: phones[0] || extractPhoneCandidate(message) || pending?.phone || "",
+      phones,
       draft: pending?.draft || "",
       instruction: pending?.instruction || "",
       fileCaption: caption,
       files,
     });
+
+    if (kind === "broadcast") {
+      if (!phones.length) {
+        await notify("Файл принят. Укажите номера для рассылки.");
+        return { ok: true, kind: "need_phone" };
+      }
+      await notify(
+        broadcastPreviewText({
+          phones,
+          draft: pending?.draft || "",
+          files,
+          fileCaption: caption,
+        }),
+      );
+      return { ok: true, kind: "broadcast_preview" };
+    }
+
+    const phone = phones[0] || extractPhoneCandidate(message) || pending?.phone || "";
     if (!phone) {
       await notify("Файл принят. Укажите номер клиента, например: +77082555595");
       return { ok: true, kind: "need_phone" };
@@ -415,6 +582,78 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
     await clearPendingOutbound();
     await notify("Отправка отменена. Клиенту ничего не ушло.");
     return { ok: true, kind: "cancelled" };
+  }
+
+  if (
+    isBroadcastPending(pending) &&
+    !isConfirmSend(message) &&
+    !extractAllPhones(message).length &&
+    !isBroadcastCommand(message) &&
+    !looksLikeManagerCommand(message, senderChatId)
+  ) {
+    const draft = String(message || "").trim();
+    const phones = pendingPhones(pending);
+    await setPendingOutbound({
+      kind: "broadcast",
+      phone: phones[0] || "",
+      phones,
+      draft,
+      instruction: pending.instruction || "",
+      fileCaption: pending.fileCaption || "",
+      files: pending.files || [],
+    });
+    await notify(
+      broadcastPreviewText({
+        phones,
+        draft,
+        files: pending.files || [],
+        fileCaption: pending.fileCaption || "",
+      }),
+    );
+    return { ok: true, kind: "broadcast_preview" };
+  }
+
+  if (isConfirmSend(message) && isBroadcastPending(pending)) {
+    const phones = pendingPhones(pending);
+    const files = normalizePendingFiles(pending.files);
+    const draft = String(pending.draft || "").trim();
+    if (!phones.length) {
+      await notify("Укажите номера для рассылки.");
+      return { ok: false };
+    }
+    if (!draft && !files.length) {
+      await notify("Нет текста или файла для рассылки. Напишите текст, затем «да».");
+      return { ok: false };
+    }
+    if (phones.length > BROADCAST_MAX_RECIPIENTS) {
+      await notify(
+        `Слишком много номеров: ${phones.length}. Максимум ${BROADCAST_MAX_RECIPIENTS} за раз.`,
+      );
+      return { ok: false };
+    }
+    if (broadcastInFlight) {
+      await notify("Рассылка уже идёт. Дождитесь отчёта.");
+      return { ok: false, kind: "broadcast_busy" };
+    }
+
+    const job = {
+      phones,
+      draft,
+      files,
+      fileCaption: pending.fileCaption || "",
+    };
+    broadcastInFlight = true;
+    await clearPendingOutbound();
+    await notify(`Начинаю рассылку на ${phones.length} номеров...`);
+    void executeBroadcast(job, notify)
+      .catch(async (error) => {
+        log("BROADCAST ERROR", { error: error.message });
+        await notify(`❌ Рассылка прервалась: ${error.message}`);
+      })
+      .finally(() => {
+        broadcastInFlight = false;
+      });
+    return { ok: true, kind: "broadcast_started", count: phones.length };
   }
 
   if (isConfirmSend(message) && pending?.files?.length && !pending?.phone) {
@@ -498,6 +737,47 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
         : `❌ Последняя отправка не прошла.\n\nНомер: ${formatPhoneDisplay(last.phone)}\nПричина: ${last.error}`,
     );
     return { ok: last.ok, kind: "last_send" };
+  }
+
+  if (actions.some((item) => item.type === "BROADCAST")) {
+    const action = actions.find((item) => item.type === "BROADCAST");
+    const phones = uniqueBroadcastPhones([
+      ...(parsed.phones || []),
+      ...String(action?.value || "").split(/[,\s]+/),
+      ...extractAllPhones(message),
+    ]);
+    if (!phones.length) {
+      await notify("Укажите номера для рассылки — каждый с новой строки или через запятую.");
+      return { ok: false };
+    }
+    if (phones.length > BROADCAST_MAX_RECIPIENTS) {
+      await notify(
+        `Слишком много номеров: ${phones.length}. Максимум ${BROADCAST_MAX_RECIPIENTS} за раз.`,
+      );
+      return { ok: false };
+    }
+
+    const draft = String(action?.text || extractBroadcastText(message) || pending?.draft || "").trim();
+    const files = pending?.files || [];
+    const fileCaption = pending?.fileCaption || "";
+    await setPendingOutbound({
+      kind: "broadcast",
+      phone: phones[0],
+      phones,
+      draft,
+      instruction: "",
+      fileCaption,
+      files,
+    });
+    await notify(
+      broadcastPreviewText({
+        phones,
+        draft,
+        files,
+        fileCaption,
+      }),
+    );
+    return { ok: true, kind: "broadcast_preview", count: phones.length };
   }
 
   if (actions.some((item) => item.type === "WAIT_FILE")) {
@@ -758,7 +1038,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       });
     } else {
       await notify(
-        "Не понял команду. Пример: 87071234567 узнай бюджет",
+        "Не понял команду. Пример: 87071234567 узнай бюджет\n\nРассылка:\nрассылка\n87071111111\n87072222222\nтекст: Добрый день!",
       );
       return { ok: false };
     }

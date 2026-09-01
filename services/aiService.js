@@ -352,15 +352,18 @@ export async function parseManagerCommandWithAi(message) {
     "Не выдумывай leadId или телефон, если их нет в тексте.",
     "actions[] type может быть:",
     "SET_MIN_PRICE, SET_GOAL, ADD_INSTRUCTION, SET_MODE, ASK_CLIENT,",
-    "EXACT_MESSAGE, AI_COMPOSE, STATUS_QUERY, LIST_LEADS, TRANSFER_TO_HUMAN.",
+    "EXACT_MESSAGE, AI_COMPOSE, STATUS_QUERY, LIST_LEADS, TRANSFER_TO_HUMAN, BROADCAST.",
     "SET_MODE value: AUTO | CONTROLLED | HUMAN | PAUSED.",
     "Если менеджер просит узнать/предложить/напомнить/написать текст — это AI_COMPOSE, даже если в тексте есть слово «картинка» или «файл» как тема.",
     "WAIT_FILE только если явно просят отправить вложение и не просят составить текст.",
     "Если есть «отправь:», «напиши дословно:», «передай дословно:» — EXACT_MESSAGE, text = точный текст после двоеточия.",
+    "Если просят рассылку / отправить всем / на несколько номеров одним текстом — BROADCAST.",
+    "Для BROADCAST заполни phones всеми номерами из текста в формате 77XXXXXXXXX и text одним сообщением для всех.",
+    "Не выдумывай номера. Не путай рассылку с командой одному клиенту.",
     "",
     `Сообщение менеджера:\n${message}`,
     "",
-    'Ответ строго JSON: {"leadId": null, "phone": null, "actions": [{"type":"...","value":"...","text":"..."}]}',
+    'Ответ строго JSON: {"leadId": null, "phone": null, "phones": [], "actions": [{"type":"...","value":"...","text":"..."}]}',
   ].join("\n");
 
   const response = await getOpenAIClient().responses.create({

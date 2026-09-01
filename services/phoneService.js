@@ -1,6 +1,3 @@
-const KZ_PHONE_RE =
-  /(?:\+?7|8)[\s-]?\(?7\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}/;
-const WA_LINK_RE = /(?:wa\.me|api\.whatsapp\.com\/send\?phone=)\/?(\d{10,15})/i;
 const DEFAULT_MANAGER_PHONE = "77077471301";
 
 export function normalizePhone(input) {
@@ -58,25 +55,47 @@ export function extractPhoneFromVcard(vcard) {
   return match ? normalizePhone(match[1]) : null;
 }
 
-export function extractPhoneCandidate(text) {
+export function extractAllPhones(text) {
   const raw = String(text || "");
-  const link = raw.match(WA_LINK_RE);
-  if (link) {
-    return normalizePhone(link[1]);
+  const found = [];
+
+  const linkRe = /(?:wa\.me|api\.whatsapp\.com\/send\?phone=)\/?(\d{10,15})/gi;
+  for (const match of raw.matchAll(linkRe)) {
+    const phone = normalizePhone(match[1]);
+    if (phone) {
+      found.push(phone);
+    }
   }
 
-  const match = raw.match(KZ_PHONE_RE);
-  if (match) {
-    return normalizePhone(match[0]);
+  const kzRe = /(?:\+?7|8)[\s-]?\(?7\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}/g;
+  for (const match of raw.matchAll(kzRe)) {
+    const phone = normalizePhone(match[0]);
+    if (phone) {
+      found.push(phone);
+    }
   }
 
-  const firstToken = raw.trim().split(/\s+/)[0];
+  return [...new Set(found)];
+}
+
+export function extractPhoneCandidate(text) {
+  const fromList = extractAllPhones(text)[0];
+  if (fromList) {
+    return fromList;
+  }
+
+  const firstToken = String(text || "").trim().split(/\s+/)[0];
   return normalizePhone(firstToken);
 }
 
 export function stripPhoneFromText(text) {
+  return stripAllPhonesFromText(text);
+}
+
+export function stripAllPhonesFromText(text) {
   return String(text || "")
-    .replace(KZ_PHONE_RE, " ")
+    .replace(/(?:wa\.me|api\.whatsapp\.com\/send\?phone=)\/?\d{10,15}/gi, " ")
+    .replace(/(?:\+?7|8)[\s-]?\(?7\d{2}\)?[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}/g, " ")
     .replace(/\bLEAD-\d+\b/gi, " ")
     .replace(/\s{2,}/g, " ")
     .trim();

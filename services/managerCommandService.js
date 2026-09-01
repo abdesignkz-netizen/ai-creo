@@ -1,10 +1,18 @@
-import { extractPhoneCandidate, normalizePhone, stripPhoneFromText } from "./phoneService.js";
+import {
+  extractAllPhones,
+  extractPhoneCandidate,
+  normalizePhone,
+  stripAllPhonesFromText,
+  stripPhoneFromText,
+} from "./phoneService.js";
 import { parseLeadId } from "./leadService.js";
 import { parseManagerCommandWithAi } from "./aiService.js";
 import { log } from "./logger.js";
 
 const EXACT_RE =
   /(?:отправь|напиши дословно|передай дословно)\s*:\s*([\s\S]+)/i;
+const BROADCAST_RE =
+  /рассылк|разошли|отправь\s+всем|всем\s+(этим\s+)?номер|на\s+номер[аы]\s*:/i;
 
 function cleanAction(action) {
   if (!action || typeof action !== "object") {
@@ -21,11 +29,56 @@ function cleanAction(action) {
   };
 }
 
+export function extractBroadcastText(message) {
+  const raw = String(message || "");
+  const marked = raw.split(/(?:^|\n)\s*(?:текст|сообщение)\s*:\s*/i)[1];
+  if (marked) {
+    return stripAllPhonesFromText(marked).replace(/\s+/g, " ").trim();
+  }
+
+  const exact = raw.match(EXACT_RE);
+  if (exact) {
+    return stripAllPhonesFromText(exact[1]).replace(/\s+/g, " ").trim();
+  }
+
+  return stripAllPhonesFromText(raw)
+    .replace(BROADCAST_RE, " ")
+    .replace(/список\s+номер[ов]*|номер[аы]?\s*:/gi, " ")
+    .replace(/^(отправь|напиши|передай|сделай)\s*/i, "")
+    .replace(/^[:\-–]\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function isBroadcastCommand(message) {
+  return BROADCAST_RE.test(String(message || ""));
+}
+
+function uniquePhones(values) {
+  return [...new Set((values || []).map((item) => normalizePhone(item)).filter(Boolean))];
+}
+
 function parseByRules(message) {
   const text = String(message || "").trim();
   const leadId = parseLeadId(text);
-  const phone = extractPhoneCandidate(text);
+  const phones = extractAllPhones(text);
+  const phone = phones[0] || extractPhoneCandidate(text);
   const actions = [];
+
+  if (isBroadcastCommand(text) && phones.length) {
+    actions.push({
+      type: "BROADCAST",
+      value: phones.join(","),
+      text: extractBroadcastText(text),
+    });
+    return {
+      leadId,
+      phone,
+      phones,
+      actions,
+      source: "rules",
+    };
+  }
 
   if (/активные лиды|покажи лиды/i.test(text)) {
     actions.push({ type: "LIST_LEADS", value: null, text: null });
@@ -118,6 +171,7 @@ function parseByRules(message) {
   return {
     leadId,
     phone,
+    phones,
     actions,
     source: "rules",
   };
@@ -126,6 +180,9 @@ function parseByRules(message) {
 function rulesAreComplete(parsed) {
   const types = new Set((parsed.actions || []).map((item) => item.type));
   if (types.has("LIST_LEADS") || types.has("LAST_SEND_STATUS")) {
+    return true;
+  }
+  if (types.has("BROADCAST") && (parsed.phones?.length || parsed.phone)) {
     return true;
   }
   if (types.has("WAIT_FILE") && parsed.phone && !types.has("AI_COMPOSE") && !types.has("EXACT_MESSAGE")) {
@@ -168,9 +225,17 @@ export async function parseManagerCommand(message) {
   try {
     const parsed = await parseManagerCommandWithAi(message);
     const actions = (parsed.actions || []).map(cleanAction).filter(Boolean);
+    const mergedPhones = uniquePhones([
+      ...(Array.isArray(parsed.phones) ? parsed.phones : []),
+      ...(fallback.phones || []),
+      ...extractAllPhones(message),
+      parsed.phone,
+      fallback.phone,
+    ]);
     const merged = {
       leadId: parseLeadId(parsed.leadId) || fallback.leadId,
-      phone: normalizePhone(parsed.phone) || fallback.phone,
+      phone: normalizePhone(parsed.phone) || fallback.phone || mergedPhones[0] || null,
+      phones: mergedPhones,
       actions: actions.length ? actions : fallback.actions,
       source: "ai",
     };
@@ -193,7 +258,7 @@ export async function parseManagerCommand(message) {
 }
 
 const COMMAND_HINT_RE =
-  /отправь|напиши|скажи|узнай|уточни|предложи|напомни|подробност|заявк|свяжись|остановись|продолжай|ниже|скидк|что с|активные лиды|покажи лиды/i;
+  /отправь|напиши|скажи|узнай|уточни|предложи|напомни|подробност|заявк|свяжись|остановись|продолжай|ниже|скидк|что с|активные лиды|покажи лиды|рассылк|разошли/i;
 
 const CONFIRM_SEND_RE =
   /^(да|ок|можно|подтверждаю)([,!.\s]+(отправь|перешли|направь|это|его|сообщение|клиенту|пожалуйста)*)*[.!]?\s*$/i;
@@ -207,6 +272,9 @@ export function looksLikeManagerCommand(message, senderPhone) {
   const text = String(message || "").trim();
   const target = extractPhoneCandidate(text);
   if (target && target !== normalizePhone(senderPhone) && COMMAND_HINT_RE.test(text)) {
+    return true;
+  }
+  if (isBroadcastCommand(text) && extractAllPhones(text).length) {
     return true;
   }
   if (CONFIRM_SEND_RE.test(text) || CONFIRM_SEND_SHORT_RE.test(text)) {
@@ -286,6 +354,12 @@ export function describeActions(actions) {
       }
       if (action.type === "WAIT_FILE") {
         return "Ожидаем фото или файл для клиента";
+      }
+      if (action.type === "BROADCAST") {
+        const count = String(action.value || "")
+          .split(",")
+          .filter(Boolean).length;
+        return `Рассылка на ${count || "несколько"} номеров`;
       }
       return action.type;
     })
