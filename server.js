@@ -63,8 +63,8 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const pendingMessages = new Map();
 const recentIncomingIds = new Map();
-const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 4000);
-const FOLLOWUP_BUFFER_MS = Math.max(1500, Math.round(MESSAGE_BUFFER_MS / 2));
+const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 2000);
+const FOLLOWUP_BUFFER_MS = Math.max(800, Math.round(MESSAGE_BUFFER_MS / 2));
 
 function validateEnv() {
   if (isAnyModelProvider()) {
