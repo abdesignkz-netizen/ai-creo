@@ -10,14 +10,16 @@ import {
 import {
   parseManagerCommand,
   describeActions,
+  cleanBroadcastInstruction,
   cleanComposeInstruction,
   extractBroadcastText,
   isBroadcastCommand,
   isCancelSend,
   isConfirmSend,
   looksLikeManagerCommand,
+  shouldComposeBroadcast,
 } from "./managerCommandService.js";
-import { composeClientMessage } from "./aiService.js";
+import { composeBroadcastMessage, composeClientMessage } from "./aiService.js";
 import { checkWhatsAppNumber, confirmOutgoingDelivery, inferFileName, sendWhatsAppFile, sendWhatsAppMessage } from "./whatsappService.js";
 import { extractAllPhones, extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, phoneFromChatId, stripPhoneFromText, toChatId } from "./phoneService.js";
 import { notifyManagerRaw } from "./notificationService.js";
@@ -296,7 +298,7 @@ function dedupeActions(actions) {
   return other;
 }
 
-function broadcastPreviewText({ phones, draft, files, fileCaption }) {
+function broadcastPreviewText({ phones, draft, instruction, files, fileCaption }) {
   const fileLines = describeFiles(files);
   const list = phones.map((phone, index) => `${index + 1}. ${formatPhoneDisplay(phone)}`).join("\n");
   return [
@@ -304,13 +306,14 @@ function broadcastPreviewText({ phones, draft, files, fileCaption }) {
     "",
     list,
     "",
+    instruction ? `Задача: ${instruction}` : null,
     fileLines.length ? `Вложение: ${fileLines.join(", ")}` : null,
     fileLines.length && fileCaption ? `Подпись к файлу: «${fileCaption}»` : null,
     draft ? `Текст:\n«${draft}»` : "Текст рассылки пока не указан.",
     "",
     draft
       ? "Отправить всем этим номерам?"
-      : "Напишите текст рассылки, затем подтвердите.",
+      : "Напишите текст рассылки или задачу для AI, затем подтвердите.",
     "Напишите: да / отправь",
     "Или: нет / отмена",
   ]
@@ -540,6 +543,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
         broadcastPreviewText({
           phones,
           draft: pending?.draft || "",
+          instruction: pending?.instruction || "",
           files,
           fileCaption: caption,
         }),
@@ -591,14 +595,36 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
     !isBroadcastCommand(message) &&
     !looksLikeManagerCommand(message, senderChatId)
   ) {
-    const draft = String(message || "").trim();
+    const incoming = String(message || "").trim();
     const phones = pendingPhones(pending);
+    const compose = shouldComposeBroadcast(incoming, incoming);
+    let draft = incoming;
+    let instruction = pending.instruction || "";
+    if (compose) {
+      instruction = cleanBroadcastInstruction(incoming);
+      try {
+        draft = await composeBroadcastMessage({ instruction });
+        if (!draft) {
+          throw new Error("AI вернул пустой текст");
+        }
+      } catch (error) {
+        await notify(
+          [
+            "❌ Не удалось составить текст рассылки",
+            "",
+            `Задача: ${instruction}`,
+            `Причина: ${error.message}`,
+          ].join("\n"),
+        );
+        return { ok: false, error: error.message };
+      }
+    }
     await setPendingOutbound({
       kind: "broadcast",
       phone: phones[0] || "",
       phones,
       draft,
-      instruction: pending.instruction || "",
+      instruction,
       fileCaption: pending.fileCaption || "",
       files: pending.files || [],
     });
@@ -606,6 +632,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       broadcastPreviewText({
         phones,
         draft,
+        instruction,
         files: pending.files || [],
         fileCaption: pending.fileCaption || "",
       }),
@@ -757,7 +784,36 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       return { ok: false };
     }
 
-    const draft = String(action?.text || extractBroadcastText(message) || pending?.draft || "").trim();
+    const extracted = String(action?.text || extractBroadcastText(message) || pending?.draft || "").trim();
+    const valueIsPhones = String(action?.value || "")
+      .split(/[,\s]+/)
+      .filter(Boolean)
+      .every((item) => /^\d{10,15}$/.test(String(item).replace(/\D/g, "")));
+    const compose = shouldComposeBroadcast(message, extracted);
+    const instruction = compose
+      ? cleanBroadcastInstruction((!valueIsPhones && action?.value) || message)
+      : "";
+
+    let draft = compose ? "" : extracted;
+    if (compose) {
+      try {
+        draft = await composeBroadcastMessage({ instruction });
+        if (!draft) {
+          throw new Error("AI вернул пустой текст");
+        }
+      } catch (error) {
+        await notify(
+          [
+            "❌ Не удалось составить текст рассылки",
+            "",
+            `Задача: ${instruction}`,
+            `Причина: ${error.message}`,
+          ].join("\n"),
+        );
+        return { ok: false, error: error.message };
+      }
+    }
+
     const files = pending?.files || [];
     const fileCaption = pending?.fileCaption || "";
     await setPendingOutbound({
@@ -765,7 +821,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       phone: phones[0],
       phones,
       draft,
-      instruction: "",
+      instruction,
       fileCaption,
       files,
     });
@@ -773,6 +829,7 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       broadcastPreviewText({
         phones,
         draft,
+        instruction,
         files,
         fileCaption,
       }),

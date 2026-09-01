@@ -36,6 +36,11 @@ export function extractBroadcastText(message) {
     return stripAllPhonesFromText(marked).replace(/\s+/g, " ").trim();
   }
 
+  const quoted = raw.match(/[«"]([^»"]{8,})[»"]/);
+  if (quoted) {
+    return stripAllPhonesFromText(quoted[1]).replace(/\s+/g, " ").trim();
+  }
+
   const exact = raw.match(EXACT_RE);
   if (exact) {
     return stripAllPhonesFromText(exact[1]).replace(/\s+/g, " ").trim();
@@ -52,6 +57,60 @@ export function extractBroadcastText(message) {
 
 export function isBroadcastCommand(message) {
   return BROADCAST_RE.test(String(message || ""));
+}
+
+export function hasExplicitBroadcastText(message) {
+  const raw = String(message || "");
+  return (
+    /(?:^|\n)\s*(?:текст|сообщение)\s*:/i.test(raw) ||
+    EXACT_RE.test(raw) ||
+    /[«"][^»"]{8,}[»"]/.test(raw)
+  );
+}
+
+export function looksLikeClientFacingBroadcast(text) {
+  const value = String(text || "").trim();
+  if (value.length < 8) {
+    return false;
+  }
+
+  const isTask = /приветственн|составь|сделай|рассылк|по номерам|напиши им|напиши всем|отправь всем|разошли/i.test(
+    value,
+  );
+  if (isTask && !/^(здравствуйте|добрый\s+(день|вечер)|доброе\s+утро|привет[,!.\s])/i.test(value)) {
+    return false;
+  }
+
+  if (/^(здравствуйте|добрый\s+(день|вечер)|доброе\s+утро|привет[,!.\s])/i.test(value)) {
+    return true;
+  }
+
+  return value.length >= 40 && /[.!?…]/.test(value) && !/^(сделай|составь|напиши|отправь|разошли)/i.test(value);
+}
+
+export function cleanBroadcastInstruction(message) {
+  return stripAllPhonesFromText(message)
+    .replace(/по\s+номерам?\s*:?/gi, " ")
+    .replace(/на\s+номер[аы]?\s*:?/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function shouldComposeBroadcast(message, extractedText = "") {
+  if (hasExplicitBroadcastText(message)) {
+    return false;
+  }
+  if (looksLikeClientFacingBroadcast(extractedText)) {
+    return false;
+  }
+
+  const task = cleanBroadcastInstruction(message)
+    .replace(BROADCAST_RE, " ")
+    .replace(/список\s+номер[ов]*/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return task.length >= 4;
 }
 
 function uniquePhones(values) {
