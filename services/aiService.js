@@ -390,6 +390,32 @@ export async function composeClientMessage({ lead, instruction, extraContext = "
   return text;
 }
 
+export async function composeFileCaption({ instruction, extraContext = "" }) {
+  const input = [
+    "Ты пишешь короткую подпись к файлу в WhatsApp от компании CREOLAB.",
+    "Одно короткое предложение, максимум 120 символов.",
+    "Выполни задачу менеджера по смыслу.",
+    "Не копируй служебные фразы: «напиши», «отправь этот файл», «на подобии», «нужно получше», «исправь подпись».",
+    "Не упоминай менеджера и что текст составлен по инструкции.",
+    extraContext ? `Контекст: ${extraContext}` : "",
+    "",
+    `Задача менеджера: ${instruction}`,
+    "",
+    "Верни только подпись к файлу, без кавычек и без пояснений.",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+
+  const response = await createAiResponse({
+    input,
+    effort: "low",
+  });
+
+  const text = String(response.output_text || "").trim().replace(/^["«]|["»]$/g, "");
+  log("AI FILE CAPTION", { chars: text.length, instruction: String(instruction || "").slice(0, 160) });
+  return text;
+}
+
 export async function composeBroadcastMessage({ instruction, extraContext = "" }) {
   const input = [
     "Ты пишешь одно исходящее WhatsApp-сообщение от компании CREOLAB для рассылки нескольким людям.",

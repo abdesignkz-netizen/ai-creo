@@ -367,6 +367,92 @@ export function isFileSendCommand(message) {
   );
 }
 
+const SEND_FILE_COMMAND_RE =
+  /(отправь|перешли|направь|прикрепи)(\s+(этот|вот|это|данный))?(\s+(файл|фото|документ|пдф|картинку|картинка|вложение))?|(этот|вот|это|данный)\s+(файл|фото|документ|пдф|картинку|картинка|вложение)/gi;
+
+const FILE_DESTINATION_RE =
+  /на\s+(этот\s+|указанный\s+)?номер|по\s+(этому\s+)?номеру|этому\s+клиенту|клиенту|вот\s+сюда|(^|\s)(сюда|туда)(?=\s|$)/gi;
+
+const CAPTION_SET_RE =
+  /(?:исправь\s+)?подпись(?:\s+к\s+файлу)?\s*(?:на)?\s*:\s*([\s\S]+)/i;
+
+const CAPTION_DELETE_RE =
+  /удали(?:\s+это)?\s+из\s+подписи(?:\s+к\s+файлу)?\s*:?\s*([\s\S]+)/i;
+
+const CAPTION_CLEAR_RE =
+  /^(убер[ий]\s+подпись|без\s+подписи|удали\s+подпись)([.!\s]|$)/i;
+
+function leftoverAfterFileCommand(message) {
+  SEND_FILE_COMMAND_RE.lastIndex = 0;
+  FILE_DESTINATION_RE.lastIndex = 0;
+  return stripPhoneFromText(message)
+    .replace(SEND_FILE_COMMAND_RE, " ")
+    .replace(FILE_DESTINATION_RE, " ")
+    .replace(/[!?.,:;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeCaptionInstruction(text) {
+  return /напиши|составь|сделай|на подобии|что-то вроде|нужно получше|получше|придумай|исправь/i.test(
+    String(text || ""),
+  );
+}
+
+function unwrapCaption(value) {
+  return String(value || "")
+    .replace(/^[«"]+|[»"]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function parseFileCaptionRequest(message) {
+  const raw = String(message || "").trim();
+  if (!raw) {
+    return { mode: "none", caption: "", instruction: "" };
+  }
+
+  const setMatch = raw.match(CAPTION_SET_RE);
+  if (setMatch) {
+    return { mode: "set", caption: unwrapCaption(setMatch[1]), instruction: "" };
+  }
+
+  const deleteMatch = raw.match(CAPTION_DELETE_RE);
+  if (deleteMatch) {
+    return { mode: "delete", caption: unwrapCaption(deleteMatch[1]), instruction: "" };
+  }
+
+  if (CAPTION_CLEAR_RE.test(raw)) {
+    return { mode: "clear", caption: "", instruction: "" };
+  }
+
+  const leftover = leftoverAfterFileCommand(raw);
+  if (
+    !leftover ||
+    /^(этот|вот|это|файл|фото|документ|пдф|пожалуйста)$/i.test(leftover) ||
+    isConfirmSend(leftover) ||
+    isCancelSend(leftover)
+  ) {
+    return { mode: "none", caption: "", instruction: "" };
+  }
+
+  if (looksLikeCaptionInstruction(leftover)) {
+    return { mode: "compose", caption: "", instruction: leftover };
+  }
+
+  return { mode: "set", caption: leftover, instruction: "" };
+}
+
+export function isCaptionEditCommand(message) {
+  const raw = String(message || "").trim();
+  return Boolean(
+    CAPTION_SET_RE.test(raw) ||
+      CAPTION_DELETE_RE.test(raw) ||
+      CAPTION_CLEAR_RE.test(raw) ||
+      /подпись/i.test(raw),
+  );
+}
+
 export function cleanComposeInstruction(message) {
   return stripPhoneFromText(message)
     .replace(/(отправь|перешли|направь|напиши)\s+/gi, " ")

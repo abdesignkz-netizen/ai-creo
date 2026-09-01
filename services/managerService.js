@@ -15,13 +15,15 @@ import {
   extractBroadcastText,
   isBroadcastCommand,
   isCancelSend,
+  isCaptionEditCommand,
   isConfirmSend,
   looksLikeManagerCommand,
+  parseFileCaptionRequest,
   shouldComposeBroadcast,
 } from "./managerCommandService.js";
-import { composeBroadcastMessage, composeClientMessage } from "./aiService.js";
+import { composeBroadcastMessage, composeClientMessage, composeFileCaption } from "./aiService.js";
 import { checkWhatsAppNumber, confirmOutgoingDelivery, inferFileName, sendWhatsAppFile, sendWhatsAppMessage } from "./whatsappService.js";
-import { extractAllPhones, extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, phoneFromChatId, stripPhoneFromText, toChatId } from "./phoneService.js";
+import { extractAllPhones, extractPhoneCandidate, formatPhoneDisplay, isManagerPhone, phoneFromChatId, toChatId } from "./phoneService.js";
 import { notifyManagerRaw } from "./notificationService.js";
 import {
   clearPendingOutbound,
@@ -137,30 +139,40 @@ function describeFiles(files) {
   );
 }
 
-const SEND_FILE_COMMAND_RE =
-  /(отправь|перешли|направь|прикрепи)(\s+(этот|вот|это|данный))?(\s+(файл|фото|документ|пдф|картинку|картинка|вложение))?|(этот|вот|это|данный)\s+(файл|фото|документ|пдф|картинку|картинка|вложение)/gi;
+function applyCaptionToFiles(files, caption) {
+  return normalizePendingFiles(files).map((file, index) => ({
+    ...file,
+    caption: index === 0 ? caption || "" : "",
+  }));
+}
 
-const FILE_DESTINATION_RE =
-  /на\s+(этот\s+|указанный\s+)?номер|по\s+(этому\s+)?номеру|этому\s+клиенту|клиенту|вот\s+сюда|(^|\s)(сюда|туда)(?=\s|$)/gi;
-
-function fileCaptionFromMessage(message) {
-  SEND_FILE_COMMAND_RE.lastIndex = 0;
-  FILE_DESTINATION_RE.lastIndex = 0;
-  const cleaned = stripPhoneFromText(message)
-    .replace(SEND_FILE_COMMAND_RE, " ")
-    .replace(FILE_DESTINATION_RE, " ")
-    .replace(/[!?.,:;]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (
-    !cleaned ||
-    /^(этот|вот|это|файл|фото|документ|пдф|пожалуйста)$/i.test(cleaned) ||
-    isConfirmSend(cleaned) ||
-    isCancelSend(cleaned)
-  ) {
+async function resolveFileCaption({ message, pending }) {
+  const parsed = parseFileCaptionRequest(message);
+  if (parsed.mode === "none") {
+    return pending?.fileCaption || "";
+  }
+  if (parsed.mode === "set") {
+    return parsed.caption;
+  }
+  if (parsed.mode === "clear") {
     return "";
   }
-  return cleaned;
+  if (parsed.mode === "delete") {
+    const current = String(pending?.fileCaption || "");
+    if (!parsed.caption) {
+      return current;
+    }
+    const escaped = parsed.caption.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return current.replace(new RegExp(escaped, "gi"), "").replace(/\s{2,}/g, " ").trim();
+  }
+  if (parsed.mode === "compose") {
+    const caption = await composeFileCaption({ instruction: parsed.instruction });
+    if (!caption) {
+      throw new Error("AI вернул пустую подпись");
+    }
+    return caption;
+  }
+  return pending?.fileCaption || "";
 }
 
 function hasPendingContent(pending) {
@@ -514,11 +526,20 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
   if (incomingFiles.length) {
     const messagePhones = uniqueBroadcastPhones(extractAllPhones(message));
     const phones = messagePhones.length ? messagePhones : pendingPhones(pending);
-    const caption = fileCaptionFromMessage(message) || pending?.fileCaption || "";
-    const files = incomingFiles.map((file, index) => ({
-      ...file,
-      caption: index === 0 ? caption : "",
-    }));
+    let caption = pending?.fileCaption || "";
+    try {
+      caption = await resolveFileCaption({ message, pending });
+    } catch (error) {
+      await notify(
+        [
+          "❌ Не удалось подготовить подпись к файлу",
+          "",
+          `Причина: ${error.message}`,
+        ].join("\n"),
+      );
+      return { ok: false, error: error.message };
+    }
+    const files = applyCaptionToFiles(incomingFiles, caption);
     const kind =
       phones.length > 1 || pending?.kind === "broadcast" || isBroadcastCommand(message)
         ? "broadcast"
@@ -586,6 +607,58 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
     await clearPendingOutbound();
     await notify("Отправка отменена. Клиенту ничего не ушло.");
     return { ok: true, kind: "cancelled" };
+  }
+
+  if (
+    pending?.files?.length &&
+    !isConfirmSend(message) &&
+    !isBroadcastCommand(message) &&
+    (isCaptionEditCommand(message) || parseFileCaptionRequest(message).mode === "compose")
+  ) {
+    try {
+      const caption = await resolveFileCaption({ message, pending });
+      const files = applyCaptionToFiles(pending.files, caption);
+      await setPendingOutbound({
+        kind: pending.kind,
+        phone: pending.phone,
+        phones: pending.phones,
+        draft: pending.draft,
+        instruction: pending.instruction,
+        fileCaption: caption,
+        files,
+      });
+      if (isBroadcastPending(pending)) {
+        await notify(
+          broadcastPreviewText({
+            phones: pendingPhones(pending),
+            draft: pending.draft,
+            instruction: pending.instruction,
+            files,
+            fileCaption: caption,
+          }),
+        );
+      } else {
+        await notify(
+          draftPreviewText({
+            phone: pending.phone,
+            draft: pending.draft,
+            instruction: pending.instruction,
+            files,
+            fileCaption: caption,
+          }),
+        );
+      }
+      return { ok: true, kind: "preview", phone: pending.phone };
+    } catch (error) {
+      await notify(
+        [
+          "❌ Не удалось обновить подпись к файлу",
+          "",
+          `Причина: ${error.message}`,
+        ].join("\n"),
+      );
+      return { ok: false, error: error.message };
+    }
   }
 
   if (
@@ -856,21 +929,34 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
       );
       return { ok: false, error: error.message };
     }
-    const caption = fileCaptionFromMessage(message) || pending?.fileCaption || "";
+    let caption = pending?.fileCaption || "";
+    try {
+      caption = await resolveFileCaption({ message, pending });
+    } catch (error) {
+      await notify(
+        [
+          "❌ Не удалось подготовить подпись к файлу",
+          "",
+          `Причина: ${error.message}`,
+        ].join("\n"),
+      );
+      return { ok: false, error: error.message };
+    }
+    const files = applyCaptionToFiles(pending?.files || [], caption);
     await setPendingOutbound({
       phone,
       draft: pending?.draft || "",
       instruction: pending?.instruction || "",
       fileCaption: caption,
-      files: pending?.files || [],
+      files,
     });
-    if (pending?.files?.length) {
+    if (files.length) {
       await notify(
         draftPreviewText({
           phone,
           draft: pending.draft,
           instruction: pending.instruction,
-          files: pending.files,
+          files,
           fileCaption: caption,
         }),
       );
