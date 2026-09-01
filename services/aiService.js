@@ -48,6 +48,7 @@ export function getOpenAIClient() {
       openaiClient = new OpenAI({
         apiKey: process.env.ANYMODEL_API_KEY,
         baseURL: process.env.ANYMODEL_BASE_URL || DEFAULT_ANYMODEL_BASE_URL,
+        timeout: 60000,
       });
     } else {
       openaiClient = new OpenAI({
@@ -56,6 +57,54 @@ export function getOpenAIClient() {
     }
   }
   return openaiClient;
+}
+
+function toUserContent(input) {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (Array.isArray(input)) {
+    return input
+      .map((item) => {
+        if (typeof item === "string") {
+          return item;
+        }
+        if (item?.content == null) {
+          return "";
+        }
+        return typeof item.content === "string" ? item.content : JSON.stringify(item.content);
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return String(input || "");
+}
+
+async function createAiResponse({ instructions, input, effort } = {}) {
+  const client = getOpenAIClient();
+  const model = getAiModel();
+
+  if (isAnyModelProvider()) {
+    const messages = [];
+    if (instructions) {
+      messages.push({ role: "system", content: instructions });
+    }
+    messages.push({ role: "user", content: toUserContent(input) });
+    const response = await client.chat.completions.create({
+      model,
+      messages,
+    });
+    return {
+      output_text: response.choices?.[0]?.message?.content || "",
+    };
+  }
+
+  return client.responses.create({
+    model,
+    ...(instructions ? { instructions } : {}),
+    ...reasoningOptions(effort),
+    input,
+  });
 }
 
 export function getTranscriptionClient() {
@@ -267,10 +316,8 @@ export async function generateAiReply({
   });
 
   const startedAt = Date.now();
-  const response = await getOpenAIClient().responses.create({
-    model: getAiModel(),
+  const response = await createAiResponse({
     instructions: systemPrompt,
-    ...reasoningOptions(),
     input: [
       {
         role: "user",
@@ -333,10 +380,9 @@ export async function composeClientMessage({ lead, instruction, extraContext = "
     .filter((line) => line !== "")
     .join("\n");
 
-  const response = await getOpenAIClient().responses.create({
-    model: getAiModel(),
-    ...reasoningOptions("low"),
+  const response = await createAiResponse({
     input,
+    effort: "low",
   });
 
   const text = String(response.output_text || "").trim();
@@ -361,10 +407,9 @@ export async function composeBroadcastMessage({ instruction, extraContext = "" }
     .filter((line) => line !== "")
     .join("\n");
 
-  const response = await getOpenAIClient().responses.create({
-    model: getAiModel(),
-    ...reasoningOptions("low"),
+  const response = await createAiResponse({
     input,
+    effort: "low",
   });
 
   const text = String(response.output_text || "").trim().replace(/^["«]|["»]$/g, "");
@@ -397,10 +442,9 @@ export async function parseManagerCommandWithAi(message) {
     'Ответ строго JSON: {"leadId": null, "phone": null, "phones": [], "actions": [{"type":"...","value":"...","text":"..."}]}',
   ].join("\n");
 
-  const response = await getOpenAIClient().responses.create({
-    model: getAiModel(),
-    ...reasoningOptions("low"),
+  const response = await createAiResponse({
     input,
+    effort: "low",
   });
 
   return extractJsonFromText(response.output_text || "");
