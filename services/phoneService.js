@@ -10,7 +10,7 @@ export function normalizePhone(input) {
     return null;
   }
 
-  const withoutChat = raw.replace(/@c\.us$/i, "");
+  const withoutChat = raw.replace(/@(c\.us|s\.whatsapp\.net|g\.us|lid)$/i, "");
   const digits = withoutChat.replace(/\D/g, "");
 
   if (!digits) {
@@ -127,4 +127,34 @@ export function getManagerChatId() {
 export function isManagerPhone(input) {
   const incoming = normalizePhone(input);
   return Boolean(incoming && getManagerPhones().includes(incoming));
+}
+
+export function resolveIncomingIdentity(body = {}) {
+  const senderData = body.senderData || {};
+  const candidates = [
+    senderData.sender,
+    senderData.chatId,
+    senderData.senderPn,
+    senderData.wid,
+    body.chatId,
+    body.senderId,
+  ].filter(Boolean);
+
+  for (const item of candidates) {
+    const phone = normalizePhone(item);
+    if (phone) {
+      return {
+        phone,
+        chatId: toChatId(phone),
+        rawChatId: senderData.chatId || body.chatId || item,
+      };
+    }
+  }
+
+  const rawChatId = senderData.chatId || senderData.sender || body.chatId || null;
+  return {
+    phone: null,
+    chatId: rawChatId,
+    rawChatId,
+  };
 }

@@ -141,6 +141,7 @@ async function postGreenApi(path, payload) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(Number(process.env.GREEN_API_TIMEOUT_MS || 20000)),
   });
 
   const raw = await response.text();
@@ -264,6 +265,7 @@ export async function checkWhatsAppNumber(phone) {
       body: JSON.stringify({
         phoneNumber: Number(normalized),
       }),
+      signal: AbortSignal.timeout(Number(process.env.GREEN_API_TIMEOUT_MS || 20000)),
     });
 
     const data = await response.json().catch(() => null);

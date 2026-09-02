@@ -20,6 +20,7 @@ import {
   extractPhoneFromVcard,
   isManagerPhone,
   phoneFromChatId,
+  resolveIncomingIdentity,
 } from "./services/phoneService.js";
 import { log } from "./services/logger.js";
 
@@ -57,7 +58,7 @@ app.use(
     methods: ["GET", "POST", "OPTIONS"],
   }),
 );
-app.use(express.json({ type: "application/json", limit: "1mb" }));
+app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
@@ -65,6 +66,8 @@ const pendingMessages = new Map();
 const recentIncomingIds = new Map();
 const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 2000);
 const FOLLOWUP_BUFFER_MS = Math.max(800, Math.round(MESSAGE_BUFFER_MS / 2));
+const FLUSH_TIMEOUT_MS = Number(process.env.FLUSH_TIMEOUT_MS || 90000);
+const VOICE_TRANSCRIBE_MS = Number(process.env.VOICE_TRANSCRIBE_MS || 20000);
 
 function validateEnv() {
   if (isAnyModelProvider()) {
@@ -320,7 +323,9 @@ app.post("/test-ai", async (req, res) => {
 });
 
 async function transcribeAudioFromUrl(fileUrl) {
-  const response = await fetch(fileUrl);
+  const response = await fetch(fileUrl, {
+    signal: AbortSignal.timeout(VOICE_TRANSCRIBE_MS),
+  });
 
   if (!response.ok) {
     throw new Error(`Не удалось скачать голосовое: ${await response.text()}`);
@@ -344,22 +349,29 @@ async function transcribeAudioFromUrl(fileUrl) {
 }
 
 async function extractIncomingText(body) {
-  const typeMessage = body?.messageData?.typeMessage;
+  const typeMessage = body?.messageData?.typeMessage || body?.typeMessage;
   const parts = [];
 
   if (typeMessage === "textMessage") {
-    parts.push(body.messageData?.textMessageData?.textMessage || "");
+    parts.push(
+      body.messageData?.textMessageData?.textMessage || body.textMessage || "",
+    );
   } else if (typeMessage === "extendedTextMessage") {
     const extra = body.messageData?.extendedTextMessageData || {};
-    parts.push(extra.text || extra.description || extra.title || "");
+    parts.push(extra.text || extra.description || extra.title || body.textMessage || "");
   } else if (typeMessage === "quotedMessage") {
     parts.push(body.messageData?.extendedTextMessageData?.text || "");
   } else if (typeMessage === "audioMessage") {
     const fileUrl = body.messageData?.fileMessageData?.downloadUrl;
+    let text = "";
     if (fileUrl) {
-      const text = await transcribeAudioFromUrl(fileUrl);
-      if (text) parts.push(`[Голосовое сообщение]: ${text}`);
+      try {
+        text = await transcribeAudioFromUrl(fileUrl);
+      } catch (error) {
+        console.error("VOICE TRANSCRIBE ERROR:", error.message);
+      }
     }
+    parts.push(text ? `[Голосовое сообщение]: ${text}` : "[Голосовое сообщение]");
   } else if (typeMessage === "contactMessage") {
     const contact = body.messageData?.contactMessageData || {};
     const phone =
@@ -383,7 +395,7 @@ const FORWARDABLE_MEDIA = new Set([
 ]);
 
 function extractIncomingMedia(body) {
-  const typeMessage = body?.messageData?.typeMessage;
+  const typeMessage = body?.messageData?.typeMessage || body?.typeMessage;
   if (!FORWARDABLE_MEDIA.has(typeMessage)) {
     return null;
   }
@@ -400,7 +412,7 @@ function extractIncomingMedia(body) {
     mimeType: file.mimeType || "",
     caption: file.caption || "",
     idMessage: body.idMessage || "",
-    chatIdFrom: body.senderData?.chatId || "",
+    chatIdFrom: resolveIncomingIdentity(body).chatId || body.senderData?.chatId || "",
   };
 }
 
@@ -473,6 +485,14 @@ async function flushPendingChat(sessionId, chatId) {
   );
   const startedAt = Date.now();
   let aborted = false;
+  const watchdog = setTimeout(() => {
+    const latest = pendingMessages.get(sessionId);
+    if (latest?.generating) {
+      log("FLUSH WATCHDOG", { sessionId, chatId });
+      latest.generating = false;
+      scheduleFlush(sessionId, chatId, FOLLOWUP_BUFFER_MS);
+    }
+  }, FLUSH_TIMEOUT_MS);
 
   try {
     if (!combinedMessage) {
@@ -499,6 +519,7 @@ async function flushPendingChat(sessionId, chatId) {
       aborted = Boolean(result?.aborted);
     }
   } finally {
+    clearTimeout(watchdog);
     const latest = pendingMessages.get(sessionId);
     if (latest && (aborted || latest.version !== bundle.version)) {
       if (aborted) {
@@ -521,98 +542,116 @@ async function flushPendingChat(sessionId, chatId) {
   });
 }
 
-app.post("/webhook", async (req, res) => {
-  console.log("WEBHOOK RECEIVED:", Date.now());
-  try {
-    const body = req.body;
+async function processIncomingWebhook(body) {
+  const identity = resolveIncomingIdentity(body);
+  const chatId = identity.chatId;
+  const senderName =
+    body.senderData?.senderName || body.senderData?.chatName || "";
+  const message = await extractIncomingText(body);
+  const media = extractIncomingMedia(body);
+  const isManager = isManagerPhone(chatId) || isManagerPhone(identity.phone);
 
-    console.log(
-      "TYPE:",
-      body.typeWebhook,
-      "CHAT:",
-      body.senderData?.chatId,
-    );
-
-    if (body.typeWebhook === "outgoingMessageStatus") {
-      noteOutgoingStatus({
-        idMessage: body.idMessage,
-        status: body.status,
-        chatId: body.chatId,
-        description: body.description,
-      });
-      await handleFailedOutboundStatus({
-        chatId: body.chatId,
-        status: body.status,
-        description: body.description,
-      });
-      return res.json({ success: true, kind: "outgoing_status" });
-    }
-
-    if (body.typeWebhook !== "incomingMessageReceived") {
-      return res.json({ success: true, skipped: "not incoming message" });
-    }
-
-    const chatId = body.senderData?.chatId;
-    const senderName =
-      body.senderData?.senderName || body.senderData?.chatName || "";
-    const message = await extractIncomingText(body);
-    const media = extractIncomingMedia(body);
-    const isManager = isManagerPhone(chatId);
-
-    if (!chatId || (!message && !media)) {
-      return res.json({ success: true, skipped: "no text message" });
-    }
-
-    const sessionId = chatId;
-    if (rememberIncomingId(sessionId, body.idMessage)) {
-      return res.json({ success: true, skipped: "duplicate incoming" });
-    }
-
-    const role = isManager ? "MANAGER" : "CLIENT";
-    log(role, { phone: phoneFromChatId(chatId), buffered: true, hasFile: Boolean(media) });
-
-    const existing = pendingMessages.get(sessionId);
-
-    const pending = existing || {
-      messages: [],
-      media: [],
-      version: 0,
-      generating: false,
-      timer: null,
-    };
-
-    if (message.trim()) {
-      pending.messages = [...pending.messages, message.trim()];
-    }
-    if (media) {
-      pending.media = [...(pending.media || []), media];
-    }
-    pending.version += 1;
-    pending.senderName = pending.senderName || senderName;
-    pendingMessages.set(sessionId, pending);
-
-    if (!pending.generating) {
-      scheduleFlush(sessionId, chatId);
-    }
-
-    return res.json({
-      success: true,
-      buffered: true,
-      role,
-      messagesCount: pending.messages.length,
-    });
-  } catch (error) {
-    console.error("WEBHOOK ERROR:", error);
-
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+  if (!chatId || (!message && !media)) {
+    log("WEBHOOK SKIP", { reason: "empty", chatId, type: body.messageData?.typeMessage });
+    return { skipped: "no text message" };
   }
+
+  const sessionId = chatId;
+  if (rememberIncomingId(sessionId, body.idMessage)) {
+    return { skipped: "duplicate incoming" };
+  }
+
+  const role = isManager ? "MANAGER" : "CLIENT";
+  log(role, {
+    phone: identity.phone || phoneFromChatId(chatId),
+    buffered: true,
+    hasFile: Boolean(media),
+  });
+
+  const existing = pendingMessages.get(sessionId);
+  const pending = existing || {
+    messages: [],
+    media: [],
+    version: 0,
+    generating: false,
+    timer: null,
+  };
+
+  if (message.trim()) {
+    pending.messages = [...pending.messages, message.trim()];
+  }
+  if (media) {
+    pending.media = [...(pending.media || []), media];
+  }
+  pending.version += 1;
+  pending.senderName = pending.senderName || senderName;
+  pendingMessages.set(sessionId, pending);
+
+  if (!pending.generating) {
+    scheduleFlush(sessionId, chatId);
+  }
+
+  return {
+    buffered: true,
+    role,
+    messagesCount: pending.messages.length,
+  };
+}
+
+async function processWebhook(body) {
+  if (body.typeWebhook === "outgoingMessageStatus") {
+    noteOutgoingStatus({
+      idMessage: body.idMessage,
+      status: body.status,
+      chatId: body.chatId,
+      description: body.description,
+    });
+    await handleFailedOutboundStatus({
+      chatId: body.chatId,
+      status: body.status,
+      description: body.description,
+    });
+    return { kind: "outgoing_status" };
+  }
+
+  if (body.typeWebhook !== "incomingMessageReceived") {
+    return { skipped: "not incoming message" };
+  }
+
+  return processIncomingWebhook(body);
+}
+
+app.post("/webhook", (req, res) => {
+  const body = req.body || {};
+  console.log(
+    "WEBHOOK RECEIVED:",
+    Date.now(),
+    "TYPE:",
+    body.typeWebhook,
+    "CHAT:",
+    body.senderData?.chatId || body.chatId,
+  );
+
+  // Green API removes the notification from the queue only after HTTP 200.
+  // Always ACK first: transcription or a hung send must not block later messages.
+  res.json({ success: true, accepted: true });
+
+  processWebhook(body).catch((error) => {
+    console.error("WEBHOOK PROCESS ERROR:", error);
+  });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   const provider = isAnyModelProvider() ? "anymodel" : "openai";
   console.log(`CREOLAB WhatsApp AI Sales Manager running on http://localhost:${PORT}`);
   console.log(`AI provider: ${provider}, model: ${getAiModel() || "not set"}`);
+
+  const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
+  if (keepAliveUrl) {
+    const ping = () => {
+      fetch(`${String(keepAliveUrl).replace(/\/$/, "")}/`).catch(() => {});
+    };
+    setInterval(ping, 8 * 60 * 1000);
+    console.log(`Keep-alive ping enabled for ${keepAliveUrl}`);
+  }
 });

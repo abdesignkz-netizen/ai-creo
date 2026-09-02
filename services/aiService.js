@@ -49,10 +49,13 @@ export function getOpenAIClient() {
         apiKey: process.env.ANYMODEL_API_KEY,
         baseURL: process.env.ANYMODEL_BASE_URL || DEFAULT_ANYMODEL_BASE_URL,
         timeout: 60000,
+        maxRetries: 0,
       });
     } else {
       openaiClient = new OpenAI({
         apiKey: process.env.OPENAI_API_KEY,
+        timeout: 60000,
+        maxRetries: 0,
       });
     }
   }
@@ -110,6 +113,8 @@ async function createAiResponse({ instructions, input, effort } = {}) {
 export function getTranscriptionClient() {
   return new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
+    timeout: Number(process.env.VOICE_TRANSCRIBE_MS || 20000),
+    maxRetries: 0,
   });
 }
 
