@@ -97,7 +97,7 @@ export async function notifyImportantEvent(lead, eventKey, note) {
     client_message_while_paused: "⏸ КЛИЕНТ НАПИСАЛ, AI НА ПАУЗЕ",
   };
 
-  const title = titles[eventKey] || "⚠️ СОБЫТИЕ";
+  const title = titles[String(eventKey).split(":")[0]] || "⚠️ СОБЫТИЕ";
   const who = [lead.clientName, lead.company].filter(Boolean).join(" / ") || "клиент";
 
   const lines = [

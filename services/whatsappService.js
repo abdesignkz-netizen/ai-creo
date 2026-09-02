@@ -1,3 +1,4 @@
+import { readFile } from "fs/promises";
 import { getManagerChatId, normalizePhone } from "./phoneService.js";
 import { log } from "./logger.js";
 
@@ -223,6 +224,42 @@ export async function sendWhatsAppFile(chatId, file) {
     return assertGreenApiSent(data, status);
   } catch (error) {
     log("GREEN API ERROR", { chatId, path: "sendFileByUrl", quota: true });
+    throw error;
+  }
+}
+
+export async function sendWhatsAppLocalFile(chatId, filePath, { fileName, caption, mimeType } = {}) {
+  const { apiToken, base } = getGreenApiBase();
+  const buffer = await readFile(filePath);
+  const form = new FormData();
+  form.append("chatId", chatId);
+  if (caption) {
+    form.append("caption", String(caption).slice(0, 900));
+  }
+  form.append(
+    "file",
+    new Blob([buffer], { type: mimeType || "application/pdf" }),
+    fileName || "file.pdf",
+  );
+
+  const response = await fetch(`${base}/sendFileByUpload/${apiToken}`, {
+    method: "POST",
+    body: form,
+    signal: AbortSignal.timeout(Number(process.env.GREEN_API_TIMEOUT_MS || 20000)),
+  });
+
+  const raw = await response.text();
+  let data = null;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = raw;
+  }
+
+  try {
+    return assertGreenApiSent(data, response.status);
+  } catch (error) {
+    log("GREEN API ERROR", { chatId, path: "sendFileByUpload", status: response.status });
     throw error;
   }
 }

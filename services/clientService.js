@@ -1,11 +1,14 @@
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import {
   appendConversation,
   getOrCreateLeadByPhone,
   hasNotification,
+  markNotification,
   updateLead,
 } from "./leadService.js";
 import { generateAiReply, detectGreeting, todayAlmatyDate } from "./aiService.js";
-import { sendWhatsAppMessage } from "./whatsappService.js";
+import { sendWhatsAppLocalFile, sendWhatsAppMessage } from "./whatsappService.js";
 import { toChatId } from "./phoneService.js";
 import {
   notifyClientReplied,
@@ -13,6 +16,21 @@ import {
   notifyNewLead,
 } from "./notificationService.js";
 import { log } from "./logger.js";
+import {
+  applyCommercialGuard,
+  commercialGuardInstruction,
+  customBudgetsFromContext,
+  looksLikePresentation,
+  presentationVolumeFromContext,
+  shouldSendPresentationKp,
+} from "./commercialGuard.js";
+
+const PRESENTATION_KP_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "files",
+  "kp-presentation-2026.pdf",
+);
 
 const chatLocks = new Map();
 
@@ -247,10 +265,32 @@ async function handleClientMessageUnlocked({
 
   const history = current.conversationHistory || [];
   const lastAi = current.lastAIMessage || "";
+  const customBudgets = customBudgetsFromContext({
+    message: fullMessage,
+    history,
+    lead: current,
+  });
+  const isPresentation = looksLikePresentation({
+    message: fullMessage,
+    history,
+    lead: current,
+  });
+  const presentationVolume = isPresentation
+    ? presentationVolumeFromContext({
+        message: fullMessage,
+        history,
+        lead: current,
+      })
+    : "unknown";
   let { reply, result, latencyMs } = await generateAiReply({
     message: fullMessage,
     history,
     lead: current,
+    extraInstruction: commercialGuardInstruction(
+      customBudgets,
+      presentationVolume,
+      isPresentation,
+    ),
   });
 
   if (shouldAbort?.()) {
@@ -263,11 +303,14 @@ async function handleClientMessageUnlocked({
       history,
       lead: current,
       extraInstruction: [
+        commercialGuardInstruction(customBudgets, presentationVolume, isPresentation),
         `Ты уже отправил клиенту: «${lastAi}».`,
         "Не повторяй те же вопросы и формулировки.",
         "Не проси прислать файл, картинку или данные, которые уже есть в истории.",
         "Ответь по-новому с учётом всех свежих сообщений и вложений.",
-      ].join(" "),
+      ]
+        .filter(Boolean)
+        .join(" "),
     }));
   }
 
@@ -283,6 +326,22 @@ async function handleClientMessageUnlocked({
       reason: "repeat",
     });
     return { skipped: true, reason: "repeat", leadId: current.leadId };
+  }
+
+  const guarded = applyCommercialGuard({
+    message: fullMessage,
+    reply,
+    result,
+    lead: current,
+    history,
+  });
+  reply = guarded.reply;
+  result = guarded.result;
+  if (guarded.blocked) {
+    log("COMMERCIAL GUARD", {
+      leadId: current.leadId,
+      amounts: guarded.amounts,
+    });
   }
 
   const nextStatus = mapPipelineStatus(result, current.status);
@@ -308,7 +367,30 @@ async function handleClientMessageUnlocked({
     { role: "assistant", content: reply },
   ]);
 
-  await sendWhatsAppMessage(toChatId(current.clientPhone) || chatId, reply);
+  const destChatId = toChatId(current.clientPhone) || chatId;
+  await sendWhatsAppMessage(destChatId, reply);
+
+  if (
+    shouldSendPresentationKp({
+      message: fullMessage,
+      history,
+      lead: current,
+      volume: guarded.volume || presentationVolume,
+      blocked: guarded.blocked,
+    }) &&
+    !hasNotification(current, "presentation_kp_sent")
+  ) {
+    try {
+      await sendWhatsAppLocalFile(destChatId, PRESENTATION_KP_PATH, {
+        fileName: "КП_Презентация_CREOLAB_2026.pdf",
+        caption: "Коммерческое предложение по презентации под ключ — пакеты до 10 и до 15 слайдов.",
+      });
+      current = await markNotification(current.leadId, "presentation_kp_sent");
+      log("PRESENTATION KP", { leadId: current.leadId, sent: true });
+    } catch (error) {
+      log("PRESENTATION KP", { leadId: current.leadId, error: error.message });
+    }
+  }
 
   if (current.source === "manager_outbound" && !hasNotification(current, "client_replied")) {
     await notifyClientReplied(current, fullMessage);
@@ -321,7 +403,11 @@ async function handleClientMessageUnlocked({
 
   const event = result?.manager_event;
   if (event && event !== "null") {
-    await notifyImportantEvent(current, event, result.manager_event_note || result.summary);
+    const eventKey =
+      event === "decision_required" && guarded.amounts?.[0]
+        ? `decision_required:${guarded.amounts[0]}`
+        : event;
+    await notifyImportantEvent(current, eventKey, result.manager_event_note || result.summary);
   }
 
   log("AI RESPONSE", {
