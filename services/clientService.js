@@ -17,15 +17,10 @@ import {
 } from "./notificationService.js";
 import { log } from "./logger.js";
 import {
-  applyCommercialGuard,
-  commercialGuardInstruction,
-  customBudgetsFromContext,
-  extractCustomBudgets,
-  isApprovedPrice,
   looksLikePresentation,
   presentationVolumeFromContext,
   shouldSendPresentationKp,
-} from "./commercialGuard.js";
+} from "./presentationKp.js";
 
 const PRESENTATION_KP_PATH = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -190,19 +185,6 @@ function pickValue(...values) {
   return null;
 }
 
-function nextLeadBudget({ result, current, customBudgets }) {
-  if (customBudgets?.length) {
-    return String(customBudgets[0]);
-  }
-  if (isApprovedPrice(result?.budget, current)) {
-    return String(result.budget);
-  }
-  if (isApprovedPrice(current?.budget, current)) {
-    return String(current.budget);
-  }
-  return null;
-}
-
 function hasSubstantiveData(lead, result, message) {
   const service = pickValue(lead.service, result?.service);
   return Boolean(
@@ -280,17 +262,6 @@ async function handleClientMessageUnlocked({
 
   const history = current.conversationHistory || [];
   const lastAi = current.lastAIMessage || "";
-  const customBudgets = customBudgetsFromContext({
-    message: fullMessage,
-    history,
-    lead: current,
-  });
-  const leftoverFakePrices = extractCustomBudgets(
-    [lastAi, ...(history || []).filter((item) => item?.role === "assistant").slice(-3).map((item) => item.content)].join(
-      "\n",
-    ),
-    current,
-  ).filter((amount) => !customBudgets.includes(amount));
   const isPresentation = looksLikePresentation({
     message: fullMessage,
     history,
@@ -307,23 +278,9 @@ async function handleClientMessageUnlocked({
     message: fullMessage,
     history,
     lead: current,
-    extraInstruction: [
-      commercialGuardInstruction(
-        customBudgets,
-        presentationVolume,
-        isPresentation,
-      ),
-      leftoverFakePrices.length
-        ? `В прошлых ответах могли ошибочно прозвучать цифры: ${leftoverFakePrices
-            .map((amount) => `${amount.toLocaleString("ru-RU")} ₸`)
-            .join(", ")}. Клиент их не называл. Не повторяй и не подтверждай.`
-        : "",
-      isPresentation
-        ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
-        : "",
-    ]
-      .filter(Boolean)
-      .join(" "),
+    extraInstruction: isPresentation
+      ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
+      : "",
   });
 
   if (shouldAbort?.()) {
@@ -336,12 +293,6 @@ async function handleClientMessageUnlocked({
       history,
       lead: current,
       extraInstruction: [
-        commercialGuardInstruction(customBudgets, presentationVolume, isPresentation),
-        leftoverFakePrices.length
-          ? `В прошлых ответах могли ошибочно прозвучать цифры: ${leftoverFakePrices
-              .map((amount) => `${amount.toLocaleString("ru-RU")} ₸`)
-              .join(", ")}. Клиент их не называл. Не повторяй и не подтверждай.`
-          : "",
         isPresentation
           ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
           : "",
@@ -369,29 +320,13 @@ async function handleClientMessageUnlocked({
     return { skipped: true, reason: "repeat", leadId: current.leadId };
   }
 
-  const guarded = applyCommercialGuard({
-    message: fullMessage,
-    reply,
-    result,
-    lead: current,
-    history,
-  });
-  reply = guarded.reply;
-  result = guarded.result;
-  if (guarded.blocked) {
-    log("COMMERCIAL GUARD", {
-      leadId: current.leadId,
-      amounts: guarded.amounts,
-    });
-  }
-
   const nextStatus = mapPipelineStatus(result, current.status);
   const patch = {
     clientName: pickValue(result.client_name, current.clientName),
     company: pickValue(result.company, current.company),
     service: pickValue(result.service, current.service),
     requestSummary: pickValue(result.summary, result.requestSummary, current.requestSummary),
-    budget: nextLeadBudget({ result, current, customBudgets }),
+    budget: pickValue(result.budget, current.budget),
     deadline: pickValue(result.deadline, current.deadline),
     status: nextStatus,
   };
@@ -417,8 +352,7 @@ async function handleClientMessageUnlocked({
     message: fullMessage,
     history,
     lead: current,
-    volume: guarded.volume || presentationVolume,
-    blocked: guarded.blocked,
+    volume: presentationVolume,
   });
   const alreadySentKp = hasNotification(current, "presentation_kp_sent");
   const clientAskedKpAgain = /(?:отправь|пришли|скинь).{0,20}(?:кп|коммерческ)|(?:кп|коммерческ).{0,20}(?:ещ[её]|повтор)/i.test(
@@ -426,7 +360,6 @@ async function handleClientMessageUnlocked({
   );
 
   if (
-    !guarded.blocked &&
     (modelAskedKp || heuristicAskedKp) &&
     (!alreadySentKp || clientAskedKpAgain)
   ) {
@@ -453,11 +386,7 @@ async function handleClientMessageUnlocked({
 
   const event = result?.manager_event;
   if (event && event !== "null") {
-    const eventKey =
-      event === "decision_required" && guarded.amounts?.[0]
-        ? `decision_required:${guarded.amounts[0]}`
-        : event;
-    await notifyImportantEvent(current, eventKey, result.manager_event_note || result.summary);
+    await notifyImportantEvent(current, event, result.manager_event_note || result.summary);
   }
 
   log("AI RESPONSE", {
