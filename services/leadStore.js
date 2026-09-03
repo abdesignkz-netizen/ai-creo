@@ -1,10 +1,9 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { dirname } from "path";
 import { log } from "./logger.js";
+import { getDataFile } from "./dataDir.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const STORE_PATH = join(__dirname, "..", "data", "leads.json");
+const STORE_PATH = getDataFile("leads.json");
 
 const emptyStore = () => ({
   counter: 0,

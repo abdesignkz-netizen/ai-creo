@@ -23,6 +23,7 @@ import {
   resolveIncomingIdentity,
 } from "./services/phoneService.js";
 import { log } from "./services/logger.js";
+import { getStorePath } from "./services/leadStore.js";
 
 dotenv.config();
 
@@ -645,6 +646,7 @@ app.listen(PORT, "0.0.0.0", () => {
   const provider = isAnyModelProvider() ? "anymodel" : "openai";
   console.log(`CREOLAB WhatsApp AI Sales Manager running on http://localhost:${PORT}`);
   console.log(`AI provider: ${provider}, model: ${getAiModel() || "not set"}`);
+  console.log(`Lead store: ${getStorePath()}`);
 
   const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
   if (keepAliveUrl) {

@@ -1,8 +1,8 @@
 import { mkdir, readFile, writeFile } from "fs/promises";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { dirname } from "path";
+import { getDataFile } from "./dataDir.js";
 
-const STORE_PATH = join(dirname(fileURLToPath(import.meta.url)), "..", "data", "manager-session.json");
+const STORE_PATH = getDataFile("manager-session.json");
 
 let pendingOutbound = null;
 let lastSend = null;
