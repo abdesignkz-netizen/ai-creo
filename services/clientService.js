@@ -286,11 +286,18 @@ async function handleClientMessageUnlocked({
     message: fullMessage,
     history,
     lead: current,
-    extraInstruction: commercialGuardInstruction(
-      customBudgets,
-      presentationVolume,
-      isPresentation,
-    ),
+    extraInstruction: [
+      commercialGuardInstruction(
+        customBudgets,
+        presentationVolume,
+        isPresentation,
+      ),
+      isPresentation
+        ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
   });
 
   if (shouldAbort?.()) {
@@ -304,6 +311,9 @@ async function handleClientMessageUnlocked({
       lead: current,
       extraInstruction: [
         commercialGuardInstruction(customBudgets, presentationVolume, isPresentation),
+        isPresentation
+          ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
+          : "",
         `Ты уже отправил клиенту: «${lastAi}».`,
         "Не повторяй те же вопросы и формулировки.",
         "Не проси прислать файл, картинку или данные, которые уже есть в истории.",
@@ -370,15 +380,24 @@ async function handleClientMessageUnlocked({
   const destChatId = toChatId(current.clientPhone) || chatId;
   await sendWhatsAppMessage(destChatId, reply);
 
+  const sendAsset = String(result?.send_asset || "").trim();
+  const modelAskedKp = /^(presentation_kp|PRESENTATION_KP_PATH)$/i.test(sendAsset);
+  const heuristicAskedKp = shouldSendPresentationKp({
+    message: fullMessage,
+    history,
+    lead: current,
+    volume: guarded.volume || presentationVolume,
+    blocked: guarded.blocked,
+  });
+  const alreadySentKp = hasNotification(current, "presentation_kp_sent");
+  const clientAskedKpAgain = /(?:отправь|пришли|скинь).{0,20}(?:кп|коммерческ)|(?:кп|коммерческ).{0,20}(?:ещ[её]|повтор)/i.test(
+    fullMessage,
+  );
+
   if (
-    shouldSendPresentationKp({
-      message: fullMessage,
-      history,
-      lead: current,
-      volume: guarded.volume || presentationVolume,
-      blocked: guarded.blocked,
-    }) &&
-    !hasNotification(current, "presentation_kp_sent")
+    !guarded.blocked &&
+    (modelAskedKp || heuristicAskedKp) &&
+    (!alreadySentKp || clientAskedKpAgain)
   ) {
     try {
       await sendWhatsAppLocalFile(destChatId, PRESENTATION_KP_PATH, {
@@ -386,7 +405,7 @@ async function handleClientMessageUnlocked({
         caption: "Коммерческое предложение по презентации под ключ — пакеты до 10 и до 15 слайдов.",
       });
       current = await markNotification(current.leadId, "presentation_kp_sent");
-      log("PRESENTATION KP", { leadId: current.leadId, sent: true });
+      log("PRESENTATION KP", { leadId: current.leadId, sent: true, send_asset: sendAsset || "heuristic" });
     } catch (error) {
       log("PRESENTATION KP", { leadId: current.leadId, error: error.message });
     }

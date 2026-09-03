@@ -259,9 +259,11 @@ export function buildDynamicLeadBlock(lead = {}, extras = {}) {
     "Дополнительно к обычному JSON можешь вернуть поля:",
     '"client_name", "company", "budget", "deadline",',
     '"pipeline_status": "new|qualified|proposal|negotiation|hot|won|lost|paused",',
-    '"manager_event": null | "hot_lead" | "price_request" | "decision_required" | "ready_to_start" | "refused" | "wants_call",',
+    '"manager_event": null | "hot_lead" | "price_request" | "decision_required" | "ready_to_start" | "refused" | "wants_call" | "none",',
     '"manager_event_note": "краткое пояснение для менеджера"',
+    '"send_asset": "none" | "presentation_kp" | "PRESENTATION_KP_PATH"',
     "Если решение менеджера обязательно — manager_event = decision_required, а клиенту ответь нейтрально без самовольных обещаний.",
+    "send_asset=presentation_kp или PRESENTATION_KP_PATH — система отправит PDF КП по презентациям после reply.",
   ]
     .filter((line) => line !== "")
     .join("\n");
