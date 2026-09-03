@@ -2,22 +2,17 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
-import { writeFile, unlink } from "fs/promises";
-import { createReadStream } from "fs";
-import os from "os";
-import { join } from "path";
 import {
   generateAiReply,
   getAiModel,
-  getTranscriptionClient,
   isAnyModelProvider,
 } from "./services/aiService.js";
 import { handleClientMessage, buildClientMessageWithMedia } from "./services/clientService.js";
 import { handleFailedOutboundStatus, handleManagerMessage } from "./services/managerService.js";
-import { noteOutgoingStatus } from "./services/whatsappService.js";
+import { extractIncomingText } from "./services/incomingExtract.js";
+import { extractVoiceForBatch, isVoiceIncoming } from "./services/voiceIncoming.js";
+import { noteOutgoingStatus, sendWhatsAppMessage } from "./services/whatsappService.js";
 import {
-  extractPhoneCandidate,
-  extractPhoneFromVcard,
   isManagerPhone,
   phoneFromChatId,
   resolveIncomingIdentity,
@@ -69,7 +64,6 @@ const recentIncomingIds = new Map();
 const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 2000);
 const FOLLOWUP_BUFFER_MS = Math.max(800, Math.round(MESSAGE_BUFFER_MS / 2));
 const FLUSH_TIMEOUT_MS = Number(process.env.FLUSH_TIMEOUT_MS || 90000);
-const VOICE_TRANSCRIBE_MS = Number(process.env.VOICE_TRANSCRIBE_MS || 20000);
 
 function validateEnv() {
   if (isAnyModelProvider()) {
@@ -324,71 +318,6 @@ app.post("/test-ai", async (req, res) => {
   }
 });
 
-async function transcribeAudioFromUrl(fileUrl) {
-  const response = await fetch(fileUrl, {
-    signal: AbortSignal.timeout(VOICE_TRANSCRIBE_MS),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Не удалось скачать голосовое: ${await response.text()}`);
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const tempFilePath = join(os.tmpdir(), `voice-${Date.now()}.ogg`);
-
-  await writeFile(tempFilePath, buffer);
-
-  try {
-    const transcription = await getTranscriptionClient().audio.transcriptions.create({
-      file: createReadStream(tempFilePath),
-      model: "whisper-1",
-    });
-
-    return transcription.text || "";
-  } finally {
-    await unlink(tempFilePath).catch(() => {});
-  }
-}
-
-async function extractIncomingText(body) {
-  const typeMessage = body?.messageData?.typeMessage || body?.typeMessage;
-  const parts = [];
-
-  if (typeMessage === "textMessage") {
-    parts.push(
-      body.messageData?.textMessageData?.textMessage || body.textMessage || "",
-    );
-  } else if (typeMessage === "extendedTextMessage") {
-    const extra = body.messageData?.extendedTextMessageData || {};
-    parts.push(extra.text || extra.description || extra.title || body.textMessage || "");
-  } else if (typeMessage === "quotedMessage") {
-    parts.push(body.messageData?.extendedTextMessageData?.text || "");
-  } else if (typeMessage === "audioMessage") {
-    const fileUrl = body.messageData?.fileMessageData?.downloadUrl;
-    let text = "";
-    if (fileUrl) {
-      try {
-        text = await transcribeAudioFromUrl(fileUrl);
-      } catch (error) {
-        console.error("VOICE TRANSCRIBE ERROR:", error.message);
-      }
-    }
-    parts.push(text ? `[Голосовое сообщение]: ${text}` : "[Голосовое сообщение]");
-  } else if (typeMessage === "contactMessage") {
-    const contact = body.messageData?.contactMessageData || {};
-    const phone =
-      extractPhoneFromVcard(contact.vcard) ||
-      extractPhoneCandidate(contact.displayName || "");
-    if (phone) parts.push(phone);
-    if (contact.displayName) parts.push(contact.displayName);
-  }
-
-  const caption = body.messageData?.fileMessageData?.caption;
-  if (caption) parts.push(caption);
-
-  return parts.filter(Boolean).join("\n").trim();
-}
-
 const FORWARDABLE_MEDIA = new Set([
   "imageMessage",
   "videoMessage",
@@ -554,18 +483,38 @@ async function processIncomingWebhook(body) {
   const chatId = identity.chatId;
   const senderName =
     body.senderData?.senderName || body.senderData?.chatName || "";
-  const message = await extractIncomingText(body);
-  const media = extractIncomingMedia(body);
   const isManager = isManagerPhone(chatId) || isManagerPhone(identity.phone);
+  const sessionId = chatId;
+
+  if (rememberIncomingId(sessionId, body.idMessage)) {
+    return { skipped: "duplicate incoming" };
+  }
+
+  let message = "";
+  let voiceNormalized = null;
+  if (isVoiceIncoming(body)) {
+    const voice = await extractVoiceForBatch(body);
+    if (!voice.ok) {
+      if (chatId) {
+        try {
+          await sendWhatsAppMessage(chatId, voice.fallbackReply);
+        } catch (error) {
+          log("VOICE FALLBACK ERROR", { error: error.message });
+        }
+      }
+      return { skipped: "voice_failed" };
+    }
+    message = voice.batchText;
+    voiceNormalized = voice.normalizedMessage?.type || "voice_transcript";
+  } else {
+    message = await extractIncomingText(body);
+  }
+
+  const media = extractIncomingMedia(body);
 
   if (!chatId || (!message && !media)) {
     log("WEBHOOK SKIP", { reason: "empty", chatId, type: body.messageData?.typeMessage });
     return { skipped: "no text message" };
-  }
-
-  const sessionId = chatId;
-  if (rememberIncomingId(sessionId, body.idMessage)) {
-    return { skipped: "duplicate incoming" };
   }
 
   const role = isManager ? "MANAGER" : "CLIENT";
@@ -573,6 +522,7 @@ async function processIncomingWebhook(body) {
     phone: identity.phone || phoneFromChatId(chatId),
     buffered: true,
     hasFile: Boolean(media),
+    voice: Boolean(voiceNormalized),
   });
 
   const existing = pendingMessages.get(sessionId);
