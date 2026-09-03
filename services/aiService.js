@@ -102,6 +102,15 @@ async function createAiResponse({ instructions, input, effort } = {}) {
 }
 
 export function getTranscriptionClient() {
+  if (isAnyModelProvider()) {
+    return new OpenAI({
+      apiKey: process.env.ANYMODEL_API_KEY,
+      baseURL: process.env.ANYMODEL_BASE_URL || DEFAULT_ANYMODEL_BASE_URL,
+      timeout: Number(process.env.VOICE_TRANSCRIBE_MS || 20000),
+      maxRetries: 0,
+    });
+  }
+
   return new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
     timeout: Number(process.env.VOICE_TRANSCRIBE_MS || 20000),
