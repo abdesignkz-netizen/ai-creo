@@ -20,6 +20,8 @@ import {
   applyCommercialGuard,
   commercialGuardInstruction,
   customBudgetsFromContext,
+  extractCustomBudgets,
+  isApprovedPrice,
   looksLikePresentation,
   presentationVolumeFromContext,
   shouldSendPresentationKp,
@@ -188,6 +190,19 @@ function pickValue(...values) {
   return null;
 }
 
+function nextLeadBudget({ result, current, customBudgets }) {
+  if (customBudgets?.length) {
+    return String(customBudgets[0]);
+  }
+  if (isApprovedPrice(result?.budget, current)) {
+    return String(result.budget);
+  }
+  if (isApprovedPrice(current?.budget, current)) {
+    return String(current.budget);
+  }
+  return null;
+}
+
 function hasSubstantiveData(lead, result, message) {
   const service = pickValue(lead.service, result?.service);
   return Boolean(
@@ -270,6 +285,12 @@ async function handleClientMessageUnlocked({
     history,
     lead: current,
   });
+  const leftoverFakePrices = extractCustomBudgets(
+    [lastAi, ...(history || []).filter((item) => item?.role === "assistant").slice(-3).map((item) => item.content)].join(
+      "\n",
+    ),
+    current,
+  ).filter((amount) => !customBudgets.includes(amount));
   const isPresentation = looksLikePresentation({
     message: fullMessage,
     history,
@@ -292,6 +313,11 @@ async function handleClientMessageUnlocked({
         presentationVolume,
         isPresentation,
       ),
+      leftoverFakePrices.length
+        ? `В прошлых ответах могли ошибочно прозвучать цифры: ${leftoverFakePrices
+            .map((amount) => `${amount.toLocaleString("ru-RU")} ₸`)
+            .join(", ")}. Клиент их не называл. Не повторяй и не подтверждай.`
+        : "",
       isPresentation
         ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
         : "",
@@ -311,6 +337,11 @@ async function handleClientMessageUnlocked({
       lead: current,
       extraInstruction: [
         commercialGuardInstruction(customBudgets, presentationVolume, isPresentation),
+        leftoverFakePrices.length
+          ? `В прошлых ответах могли ошибочно прозвучать цифры: ${leftoverFakePrices
+              .map((amount) => `${amount.toLocaleString("ru-RU")} ₸`)
+              .join(", ")}. Клиент их не называл. Не повторяй и не подтверждай.`
+          : "",
         isPresentation
           ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
           : "",
@@ -360,7 +391,7 @@ async function handleClientMessageUnlocked({
     company: pickValue(result.company, current.company),
     service: pickValue(result.service, current.service),
     requestSummary: pickValue(result.summary, result.requestSummary, current.requestSummary),
-    budget: pickValue(result.budget, current.budget),
+    budget: nextLeadBudget({ result, current, customBudgets }),
     deadline: pickValue(result.deadline, current.deadline),
     status: nextStatus,
   };

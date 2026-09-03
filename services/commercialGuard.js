@@ -5,8 +5,6 @@ const CATALOG_PRICES = new Set([
 const COMMIT_RE =
   /под такой бюджет|за эти деньги|уложитьс|уложиться|можно рассмотреть|сделаем за|компактн\w* вариант|ориентир понял|как ориентир|зафиксировал.{0,40}\d|бюджет.{0,40}сдела|сдела.{0,40}бюджет|подтвержд|за \d[\d\s.]{2,}/i;
 
-const PACKAGE_RE = /слайд|полный объ[её]м|под ключ за|сделаем за|компактн/i;
-
 const PRICE_TALK_RE = /сколько\s+стоит|цен[аыу]|стоимост|прайс|тариф|пакет|кп\b|коммерческ/i;
 
 export function parseMoneyAmounts(text) {
@@ -15,19 +13,29 @@ export function parseMoneyAmounts(text) {
 
   for (const match of raw.matchAll(/(\d+(?:[.,]\d+)?)\s*(?:к|тыс\.?|тысяч)/gi)) {
     const value = Math.round(Number(String(match[1]).replace(",", ".")) * 1000);
-    if (value >= 1000 && value <= 20000000) {
+    if (isPlausibleMoney(value)) {
       found.add(value);
     }
   }
 
-  for (const match of raw.matchAll(/(?<![\d])(\d{1,3}(?:[\s.,]\d{3})+|\d{4,7})(?![\d])/g)) {
+  for (const match of raw.matchAll(/(?<![\d])(\d{1,3}(?:[\s.,]\d{3})+|\d{5,7})(?![\d])/g)) {
     const value = Number(String(match[1]).replace(/[\s.,]/g, ""));
-    if (value >= 1000 && value <= 20000000) {
+    if (isPlausibleMoney(value)) {
       found.add(value);
     }
   }
 
   return [...found];
+}
+
+function isPlausibleMoney(value) {
+  if (!Number.isFinite(value) || value < 10000 || value > 20000000) {
+    return false;
+  }
+  if (value >= 1900 && value <= 2099) {
+    return false;
+  }
+  return value % 1000 === 0;
 }
 
 export function isApprovedPrice(amount, lead = {}) {
@@ -227,7 +235,7 @@ export function customBudgetsFromContext({ message, history = [], lead = {} }) {
     }
   }
 
-  return extractCustomBudgets(lead.budget, lead);
+  return [];
 }
 
 export function commercialGuardInstruction(amounts, volume = "unknown", isPresentation = false) {
@@ -235,9 +243,8 @@ export function commercialGuardInstruction(amounts, volume = "unknown", isPresen
 
   if (volume === "small") {
     parts.push(
-      "Объём презентации меньше 10 слайдов (например 5–6 + таргет). Цену не называй, пакет не подстраивай, «сделаем за эти деньги» запрещено.",
-      "manager_event=decision_required.",
-      "Клиенту: такой объём считаем отдельно, сразу стоимость не подтверждаю.",
+      "Объём меньше 10 слайдов: можно назвать только цены из прайса по комплектации.",
+      "Другие цифры, «сделаем за эти деньги» и подтверждение бюджета клиента запрещены.",
     );
   } else if (volume === "oversize") {
     parts.push(
@@ -260,10 +267,10 @@ export function commercialGuardInstruction(amounts, volume = "unknown", isPresen
   if (amounts.length) {
     const listed = amounts.map((amount) => `${amount.toLocaleString("ru-RU")} ₸`).join(", ");
     parts.push(
-      `Клиент назвал свою сумму: ${listed}. Это не цена из КП.`,
-      "Запрещено подтверждать объём, пакет, скидку или «компактный вариант» под эти деньги.",
+      `Клиент назвал свою сумму: ${listed}. Это не цена из прайса.`,
+      "Не повторяй эту цифру клиенту. Не пиши «ориентир принял», «сделаем за эти деньги», «под такой бюджет».",
       "manager_event=decision_required.",
-      "Клиенту: ориентир принял, объём и точную стоимость сам не подтверждаю, согласуем отдельно.",
+      "Клиенту: свою сумму сам не подтверждаю, могу назвать только цены из прайса.",
     );
   }
 
@@ -279,19 +286,31 @@ function formatAmount(amount) {
   return `${Number(amount).toLocaleString("ru-RU")} ₸`;
 }
 
-export function buildSafeCommercialReply(amount, volume = "unknown") {
+export function buildSafeCommercialReply(_amount, volume = "unknown", namedByClient = false) {
   if (volume === "small") {
     return [
-      "Такой объём — меньше 10 слайдов — считаем отдельно, сразу стоимость не подтверждаю.",
-      "Пришлите материалы и задачу, согласуем формат.",
+      "Назвать могу только цены из прайса CREOLAB по выбранной комплектации.",
+      "Пришлите материалы и задачу — сориентирую по пакету.",
     ].join(" ");
   }
 
-  const label = amount ? formatAmount(amount) : "этот бюджет";
+  if (volume === "oversize") {
+    return [
+      "Пакеты из прайса покрывают до 15 слайдов, всё что больше считаем отдельно.",
+      "Пришлите материалы и задачу — согласуем формат.",
+    ].join(" ");
+  }
+
+  if (namedByClient) {
+    return [
+      "Свою сумму сам не подтверждаю и пакет под неё не подстраиваю.",
+      "Могу назвать только цены из прайса CREOLAB либо согласуем отдельно.",
+    ].join(" ");
+  }
+
   return [
-    `${label} как ориентир принял.`,
-    "Объём работ и точную стоимость по такой сумме сам не подтверждаю — это согласуем отдельно.",
-    "Можете прислать материалы, продолжим по задаче.",
+    "Стоимость называю только по прайсу CREOLAB, другие цифры не подтверждаю.",
+    "Напишите объём задачи — сориентирую по пакету.",
   ].join(" ");
 }
 
@@ -328,51 +347,69 @@ export function applyCommercialGuard({
   const volume = looksLikePresentation({ message, history, lead })
     ? presentationVolumeFromContext({ message, history, lead })
     : "unknown";
-  const commits = COMMIT_RE.test(reply) || (custom.length > 0 && PACKAGE_RE.test(reply));
-  const quotedCatalogOnSmall =
-    volume === "small" && parseMoneyAmounts(reply).some((amount) => isApprovedPrice(amount, lead));
+  const commits =
+    COMMIT_RE.test(reply) ||
+    (custom.length > 0 && /сделаем за|под такой бюджет|компактн|подстрою/i.test(reply));
   const needsDecision =
     custom.length > 0 ||
-    (invented.length > 0 && commits) ||
-    volume === "small" ||
+    invented.length > 0 ||
     volume === "oversize";
 
   if (!needsDecision) {
-    return { reply, result, blocked: false, amounts: [], volume };
+    return {
+      reply,
+      result: {
+        ...result,
+        budget: approvedBudgetOrEmpty(result.budget, lead),
+      },
+      blocked: false,
+      amounts: [],
+      volume,
+    };
   }
 
-  const amount = custom[0] || invented[0] || null;
   const unsafe =
     commits ||
     invented.length > 0 ||
-    quotedCatalogOnSmall ||
-    /подстрою|комфортн\w* бюджет|что реально сделать за/i.test(reply) ||
-    ((volume === "small" || volume === "oversize") &&
-      (/₸|тенге|стоим|пакет|зафиксир/i.test(reply) || commits));
+    /подстрою|комфортн\w* бюджет|что реально сделать за|ориентир принял/i.test(reply) ||
+    (volume === "oversize" && /₸|тенге|стоим|зафиксир/i.test(reply));
 
-  const nextReply = unsafe ? buildSafeCommercialReply(amount, volume) : reply;
+  const nextReply = unsafe
+    ? buildSafeCommercialReply(custom[0] || null, volume, custom.length > 0)
+    : reply;
   const note = [
-    volume === "small"
-      ? "Объём презентации меньше 10 слайдов — цену должен сказать живой менеджер."
-      : volume === "oversize"
-        ? "Объём больше 15 слайдов — доп. слайды и цену должен подтвердить менеджер."
-        : amount
-          ? `Клиент назвал ${formatAmount(amount)}.`
+    volume === "oversize"
+      ? "Объём больше 15 слайдов — доп. слайды и цену должен подтвердить менеджер."
+      : custom.length
+        ? `Клиент назвал свою сумму ${formatAmount(custom[0])}.`
+        : invented.length
+          ? "Модель назвала цифру не из прайса."
           : "Нестандартные коммерческие условия.",
-    "AI не должен подтверждать объём, скидку или свою цену.",
-    "Нужно решение живого менеджера.",
-  ].join(" ");
+    "AI не должен подтверждать чужой бюджет, скидку или выдуманную цену.",
+    custom.length || invented.length || volume === "oversize"
+      ? "Нужно решение живого менеджера."
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return {
     reply: nextReply,
     result: {
       ...result,
-      budget: amount ? String(amount) : result.budget,
-      manager_event: "decision_required",
-      manager_event_note: note,
+      budget: custom[0] ? String(custom[0]) : approvedBudgetOrEmpty(result.budget, lead),
+      manager_event:
+        custom.length || invented.length || volume === "oversize"
+          ? "decision_required"
+          : result.manager_event,
+      manager_event_note: unsafe ? note : result.manager_event_note,
     },
     blocked: unsafe,
-    amounts: custom.length ? custom : invented,
+    amounts: custom,
     volume,
   };
+}
+
+function approvedBudgetOrEmpty(value, lead) {
+  return isApprovedPrice(value, lead) ? String(value) : "";
 }
