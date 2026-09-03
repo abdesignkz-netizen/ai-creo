@@ -24,6 +24,7 @@ import {
 } from "./services/phoneService.js";
 import { log } from "./services/logger.js";
 import { getStorePath } from "./services/leadStore.js";
+import { logAssistantRuntimeChecks } from "./services/appConfig.js";
 
 dotenv.config();
 
@@ -442,11 +443,14 @@ function rememberIncomingId(sessionId, idMessage) {
 function takePendingBundle(pending) {
   const messages = [...(pending.messages || [])];
   const media = [...(pending.media || [])];
+  const idMessages = [...(pending.idMessages || [])];
   pending.messages = [];
   pending.media = [];
+  pending.idMessages = [];
   return {
     messages,
     media,
+    idMessages,
     version: pending.version,
     senderName: pending.senderName,
   };
@@ -512,6 +516,7 @@ async function flushPendingChat(sessionId, chatId) {
         message: bundle.messages.join("\n"),
         senderName: bundle.senderName,
         media: bundle.media,
+        incomingMessageId: bundle.idMessages.filter(Boolean).join("+"),
         shouldAbort: () => {
           const latest = pendingMessages.get(sessionId);
           return Boolean(latest && latest.version !== bundle.version);
@@ -526,6 +531,7 @@ async function flushPendingChat(sessionId, chatId) {
       if (aborted) {
         latest.messages = [...bundle.messages, ...latest.messages];
         latest.media = [...bundle.media, ...latest.media];
+        latest.idMessages = [...bundle.idMessages, ...(latest.idMessages || [])];
       }
       latest.generating = false;
       scheduleFlush(sessionId, chatId, FOLLOWUP_BUFFER_MS);
@@ -573,6 +579,7 @@ async function processIncomingWebhook(body) {
   const pending = existing || {
     messages: [],
     media: [],
+    idMessages: [],
     version: 0,
     generating: false,
     timer: null,
@@ -583,6 +590,9 @@ async function processIncomingWebhook(body) {
   }
   if (media) {
     pending.media = [...(pending.media || []), media];
+  }
+  if (body.idMessage) {
+    pending.idMessages = [...(pending.idMessages || []), body.idMessage];
   }
   pending.version += 1;
   pending.senderName = pending.senderName || senderName;
@@ -647,6 +657,9 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`CREOLAB WhatsApp AI Sales Manager running on http://localhost:${PORT}`);
   console.log(`AI provider: ${provider}, model: ${getAiModel() || "not set"}`);
   console.log(`Lead store: ${getStorePath()}`);
+  logAssistantRuntimeChecks().catch((error) => {
+    console.error("CONFIG CHECK ERROR:", error.message);
+  });
 
   const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
   if (keepAliveUrl) {

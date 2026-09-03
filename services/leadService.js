@@ -15,6 +15,38 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function applyLeadDefaults(lead) {
+  if (!lead) {
+    return lead;
+  }
+  if (lead.greeting_sent === undefined) {
+    lead.greeting_sent = Boolean(lead.lastGreetingDate);
+  }
+  if (lead.handoff_already_created === undefined) {
+    lead.handoff_already_created = Boolean(
+      (lead.notificationEvents || []).includes("new_lead") ||
+        (lead.notificationEvents || []).includes(`handoff:${lead.leadId}`),
+    );
+  }
+  if (lead.presentation_kp_already_sent === undefined) {
+    lead.presentation_kp_already_sent = Boolean(
+      (lead.notificationEvents || []).includes("presentation_kp_sent"),
+    );
+  }
+  if (lead.decision_event_already_registered === undefined) {
+    lead.decision_event_already_registered = (lead.notificationEvents || []).some(
+      (key) => key === "decision_required" || String(key).includes(":decision_required:"),
+    );
+  }
+  if (lead.human_requested === undefined) {
+    lead.human_requested = lead.aiMode === "HUMAN";
+  }
+  if (lead.brief_completed === undefined) {
+    lead.brief_completed = false;
+  }
+  return lead;
+}
+
 function createLeadId(counter) {
   return `LEAD-${String(counter).padStart(4, "0")}`;
 }
@@ -53,6 +85,12 @@ export function createEmptyLead({
     lastClientMessage: "",
     lastAIMessage: "",
     lastGreetingDate: null,
+    greeting_sent: false,
+    handoff_already_created: false,
+    presentation_kp_already_sent: false,
+    decision_event_already_registered: false,
+    human_requested: false,
+    brief_completed: false,
     minPrice: null,
     goal: null,
     createdAt: timestamp,
@@ -87,7 +125,8 @@ export async function getOrCreateLeadByPhone(phone, extras = {}) {
   return withStore((store) => {
     const existingId = store.phoneIndex[normalized];
     if (existingId && store.leads[existingId]) {
-      return store.leads[existingId];
+      const existing = store.leads[existingId];
+      return applyLeadDefaults(existing);
     }
 
     store.counter += 1;

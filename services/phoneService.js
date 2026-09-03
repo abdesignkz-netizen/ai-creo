@@ -1,5 +1,3 @@
-const DEFAULT_MANAGER_PHONE = "77077471301";
-
 export function normalizePhone(input) {
   if (input === undefined || input === null) {
     return null;
@@ -102,10 +100,14 @@ export function stripAllPhonesFromText(text) {
 }
 
 export function getManagerPhones() {
-  const fromEnv = [process.env.MANAGER_PHONE, process.env.MANAGER_CHAT_ID]
+  const fromEnv = [
+    process.env.SALES_MANAGER_WHATSAPP,
+    process.env.MANAGER_PHONE,
+    process.env.MANAGER_CHAT_ID,
+  ]
     .filter(Boolean)
     .join(",");
-  const raw = fromEnv || DEFAULT_MANAGER_PHONE;
+  const raw = fromEnv;
 
   const phones = raw
     .split(/[,;]+/)

@@ -1,4 +1,5 @@
 import { readFile } from "fs/promises";
+import { getSalesManagerChatId } from "./appConfig.js";
 import { getManagerChatId, normalizePhone } from "./phoneService.js";
 import { log } from "./logger.js";
 
@@ -279,9 +280,9 @@ export async function sendWhatsAppMessage(chatId, message) {
 }
 
 export async function sendManagerMessage(message) {
-  const chatId = getManagerChatId();
+  const chatId = getSalesManagerChatId() || getManagerChatId();
   if (!chatId) {
-    throw new Error("MANAGER_PHONE не задан");
+    throw new Error("SALES_MANAGER_WHATSAPP не задан");
   }
   return sendWhatsAppMessage(chatId, message);
 }

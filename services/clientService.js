@@ -1,41 +1,27 @@
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
 import {
   appendConversation,
   getOrCreateLeadByPhone,
   hasNotification,
-  markNotification,
   updateLead,
 } from "./leadService.js";
 import { generateAiReply, detectGreeting, todayAlmatyDate } from "./aiService.js";
-import { sendWhatsAppLocalFile, sendWhatsAppMessage } from "./whatsappService.js";
+import { isUsableClientReply } from "./aiReplyParser.js";
+import { processAssistantActions } from "./assistantActions.js";
+import {
+  buildShouldGreetState,
+  finalizeGreetingAfterSend,
+  releaseGreeting,
+  reserveGreeting,
+} from "./greetingState.js";
+import { sendWhatsAppMessage } from "./whatsappService.js";
 import { toChatId } from "./phoneService.js";
 import {
   notifyClientReplied,
   notifyImportantEvent,
-  notifyNewLead,
 } from "./notificationService.js";
 import { log } from "./logger.js";
-import {
-  looksLikePresentation,
-  presentationVolumeFromContext,
-  shouldSendPresentationKp,
-} from "./presentationKp.js";
-
-const PRESENTATION_KP_PATH = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "files",
-  "kp-presentation-2026.pdf",
-);
 
 const chatLocks = new Map();
-
-const TRIVIAL_RE =
-  /^(здравствуйте|здравстуйте|добрый день|добрый вечер|доброе утро|привет|хай|hello|hi|сколько стоит\??|цена\??|стоимость\??)[\s!.?]*$/i;
-
-const SERVICE_RE =
-  /сайт|лендинг|реклам|презентац|магазин|ai[\s-]?менеджер|google ads|tiktok/i;
 
 function withChatLock(chatId, task) {
   const key = String(chatId || "unknown");
@@ -155,25 +141,24 @@ export function isSimilarReply(next, previous) {
   return sameAsk.some((pattern) => pattern.test(next) && pattern.test(previous));
 }
 
-function isTrivialMessage(message) {
-  return TRIVIAL_RE.test(String(message || "").trim());
-}
+const CLOSED_PIPELINE = new Set(["won", "lost", "paused"]);
 
-function mentionsService(message) {
-  return SERVICE_RE.test(String(message || ""));
-}
-
-function mapPipelineStatus(result, current) {
+export function mapPipelineStatus(result, current) {
+  let next;
   if (result?.pipeline_status) {
-    return result.pipeline_status;
+    next = result.pipeline_status;
+  } else if (result?.lead_status === "hot") {
+    next = "hot";
+  } else if (result?.lead_status === "warm" && current === "new") {
+    next = "qualified";
+  } else {
+    next = current || "new";
   }
-  if (result?.lead_status === "hot") {
-    return current === "new" ? "hot" : current === "qualified" ? "hot" : "hot";
+
+  if (current === "hot" && next !== "hot" && !CLOSED_PIPELINE.has(next)) {
+    return "hot";
   }
-  if (result?.lead_status === "warm" && current === "new") {
-    return "qualified";
-  }
-  return current || "new";
+  return next;
 }
 
 function pickValue(...values) {
@@ -185,32 +170,17 @@ function pickValue(...values) {
   return null;
 }
 
-function hasSubstantiveData(lead, result, message) {
-  const service = pickValue(lead.service, result?.service);
-  return Boolean(
-    lead.company ||
-      lead.clientName ||
-      lead.requestSummary ||
-      lead.budget ||
-      lead.deadline ||
-      (service && service !== "unknown") ||
-      result?.brief_completed ||
-      mentionsService(message) ||
-      (!isTrivialMessage(message) && String(message).trim().length >= 18),
-  );
-}
-
-function shouldNotifyNewLead(lead, result, message) {
-  if (hasNotification(lead, "new_lead")) {
-    return false;
-  }
-  if (lead.source === "manager_outbound") {
-    return false;
-  }
-  if (isTrivialMessage(message) && !lead.company && !lead.clientName && !mentionsService(message)) {
-    return false;
-  }
-  return hasSubstantiveData(lead, result, message);
+function buildActionStateInstruction(lead) {
+  const kpSent =
+    lead.presentation_kp_already_sent === true ||
+    hasNotification(lead, "presentation_kp_sent");
+  return [
+    `handoff_already_created=${lead.handoff_already_created === true ? "true" : "false"}`,
+    `presentation_kp_already_sent=${kpSent ? "true" : "false"}`,
+    `decision_event_already_registered=${lead.decision_event_already_registered === true ? "true" : "false"}`,
+    `brief_completed=${lead.brief_completed === true ? "true" : "false"}`,
+    `current_lead_status=${lead.status || "new"}`,
+  ].join(" ");
 }
 
 async function handleClientMessageUnlocked({
@@ -219,6 +189,7 @@ async function handleClientMessageUnlocked({
   senderName,
   media = [],
   shouldAbort,
+  incomingMessageId,
 }) {
   const fullMessage = buildClientMessageWithMedia(message, media);
   log("CLIENT", {
@@ -262,28 +233,34 @@ async function handleClientMessageUnlocked({
 
   const history = current.conversationHistory || [];
   const lastAi = current.lastAIMessage || "";
-  const isPresentation = looksLikePresentation({
-    message: fullMessage,
-    history,
-    lead: current,
-  });
-  const presentationVolume = isPresentation
-    ? presentationVolumeFromContext({
-        message: fullMessage,
-        history,
-        lead: current,
-      })
-    : "unknown";
-  let { reply, result, latencyMs } = await generateAiReply({
-    message: fullMessage,
-    history,
-    lead: current,
-    extraInstruction: isPresentation
-      ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
-      : "",
-  });
+  const appState = buildShouldGreetState(current);
+  const reservedGreeting = appState.should_greet ? reserveGreeting(current.leadId) : false;
+  if (appState.should_greet && !reservedGreeting) {
+    appState.should_greet = false;
+  }
+  const actionStateInstruction = buildActionStateInstruction(current);
+  let reply;
+  let result;
+  let latencyMs;
+  try {
+    ({ reply, result, latencyMs } = await generateAiReply({
+      message: fullMessage,
+      history,
+      lead: current,
+      extraInstruction: actionStateInstruction,
+      appState,
+    }));
+  } catch (error) {
+    if (reservedGreeting) {
+      releaseGreeting(current.leadId);
+    }
+    throw error;
+  }
 
   if (shouldAbort?.()) {
+    if (reservedGreeting) {
+      releaseGreeting(current.leadId);
+    }
     return { aborted: true, leadId: current.leadId };
   }
 
@@ -293,9 +270,7 @@ async function handleClientMessageUnlocked({
       history,
       lead: current,
       extraInstruction: [
-        isPresentation
-          ? `presentation_kp_already_sent=${hasNotification(current, "presentation_kp_sent") ? "true" : "false"}`
-          : "",
+        actionStateInstruction,
         `Ты уже отправил клиенту: «${lastAi}».`,
         "Не повторяй те же вопросы и формулировки.",
         "Не проси прислать файл, картинку или данные, которые уже есть в истории.",
@@ -303,14 +278,21 @@ async function handleClientMessageUnlocked({
       ]
         .filter(Boolean)
         .join(" "),
+      appState,
     }));
   }
 
   if (shouldAbort?.()) {
+    if (reservedGreeting) {
+      releaseGreeting(current.leadId);
+    }
     return { aborted: true, leadId: current.leadId };
   }
 
   if (isSimilarReply(reply, lastAi)) {
+    if (reservedGreeting) {
+      releaseGreeting(current.leadId);
+    }
     await appendConversation(current.leadId, [{ role: "user", content: fullMessage }]);
     log("AI RESPONSE", {
       leadId: current.leadId,
@@ -318,6 +300,18 @@ async function handleClientMessageUnlocked({
       reason: "repeat",
     });
     return { skipped: true, reason: "repeat", leadId: current.leadId };
+  }
+
+  if (result?.parse_error || !isUsableClientReply(reply)) {
+    if (reservedGreeting) {
+      releaseGreeting(current.leadId);
+    }
+    log("AI PARSE ERROR", {
+      leadId: current.leadId,
+      skippedReply: true,
+      reason: "invalid_ai_json",
+    });
+    return { skipped: true, reason: "invalid_ai_json", leadId: current.leadId };
   }
 
   const nextStatus = mapPipelineStatus(result, current.status);
@@ -329,6 +323,7 @@ async function handleClientMessageUnlocked({
     budget: pickValue(result.budget, current.budget),
     deadline: pickValue(result.deadline, current.deadline),
     status: nextStatus,
+    brief_completed: current.brief_completed === true ? true : result.brief_completed === true,
   };
 
   if (detectGreeting(reply) && !current.lastGreetingDate) {
@@ -337,56 +332,58 @@ async function handleClientMessageUnlocked({
     patch.lastGreetingDate = todayAlmatyDate();
   }
 
-  current = await updateLead(current.leadId, patch);
-  current = await appendConversation(current.leadId, [
-    { role: "user", content: fullMessage },
-    { role: "assistant", content: reply },
-  ]);
-
   const destChatId = toChatId(current.clientPhone) || chatId;
-  await sendWhatsAppMessage(destChatId, reply);
-
-  const sendAsset = String(result?.send_asset || "").trim();
-  const modelAskedKp = /^(presentation_kp|PRESENTATION_KP_PATH)$/i.test(sendAsset);
-  const heuristicAskedKp = shouldSendPresentationKp({
-    message: fullMessage,
-    history,
-    lead: current,
-    volume: presentationVolume,
-  });
-  const alreadySentKp = hasNotification(current, "presentation_kp_sent");
-  const clientAskedKpAgain = /(?:отправь|пришли|скинь).{0,20}(?:кп|коммерческ)|(?:кп|коммерческ).{0,20}(?:ещ[её]|повтор)/i.test(
-    fullMessage,
-  );
-
-  if (
-    (modelAskedKp || heuristicAskedKp) &&
-    (!alreadySentKp || clientAskedKpAgain)
-  ) {
-    try {
-      await sendWhatsAppLocalFile(destChatId, PRESENTATION_KP_PATH, {
-        fileName: "КП_Презентация_CREOLAB_2026.pdf",
-        caption: "Коммерческое предложение по презентации под ключ — пакеты до 10 и до 15 слайдов.",
-      });
-      current = await markNotification(current.leadId, "presentation_kp_sent");
-      log("PRESENTATION KP", { leadId: current.leadId, sent: true, send_asset: sendAsset || "heuristic" });
-    } catch (error) {
-      log("PRESENTATION KP", { leadId: current.leadId, error: error.message });
+  try {
+    current = await updateLead(current.leadId, patch);
+    current = await appendConversation(current.leadId, [
+      { role: "user", content: fullMessage },
+      { role: "assistant", content: reply },
+    ]);
+    await sendWhatsAppMessage(destChatId, reply);
+    const greetingResult = await finalizeGreetingAfterSend({
+      leadId: current.leadId,
+      shouldGreet: reservedGreeting,
+      sendSucceeded: true,
+      updateLead,
+    });
+    if (greetingResult.persisted) {
+      current = { ...current, greeting_sent: true };
     }
+  } catch (error) {
+    await finalizeGreetingAfterSend({
+      leadId: current.leadId,
+      shouldGreet: reservedGreeting,
+      sendSucceeded: false,
+      updateLead,
+    });
+    throw error;
+  }
+
+  try {
+    await processAssistantActions({
+      parsedResponse: result,
+      conversation: current,
+      incomingMessage: {
+        text: fullMessage,
+        id: incomingMessageId,
+      },
+      contact: {
+        phone: current.clientPhone,
+        chatId: destChatId,
+        name: current.clientName,
+      },
+      replyAlreadySent: true,
+    });
+  } catch (error) {
+    log("ASSISTANT ACTION ERROR", {
+      leadId: current.leadId,
+      error: error.message,
+    });
   }
 
   if (current.source === "manager_outbound" && !hasNotification(current, "client_replied")) {
     await notifyClientReplied(current, fullMessage);
     current = { ...current, notificationEvents: [...(current.notificationEvents || []), "client_replied"] };
-  }
-
-  if (shouldNotifyNewLead(current, result, fullMessage)) {
-    await notifyNewLead(current);
-  }
-
-  const event = result?.manager_event;
-  if (event && event !== "null") {
-    await notifyImportantEvent(current, event, result.manager_event_note || result.summary);
   }
 
   log("AI RESPONSE", {
