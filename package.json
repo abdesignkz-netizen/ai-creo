@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test tests/greetingState.test.js tests/aiReplyParser.test.js tests/assistantActions.test.js tests/prelaunchMocks.test.js tests/voiceIncoming.test.js tests/managementControl.test.js",
+    "test": "node --test tests/greetingState.test.js tests/aiReplyParser.test.js tests/assistantActions.test.js tests/prelaunchMocks.test.js tests/voiceIncoming.test.js tests/managementControl.test.js tests/outboundReplyGuard.test.js",
     "eval:ai-manager": "node scripts/evalAiManager.js",
     "dev": "node server.js",
     "start": "node server.js"

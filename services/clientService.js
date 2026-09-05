@@ -21,6 +21,7 @@ import {
   collectManagementEffects,
   formatActiveManagementPrompt,
 } from "./managementControl.js";
+import { shouldSkipForeignBotReply } from "./outboundReplyGuard.js";
 import {
   notifyClientReplied,
   notifyImportantEvent,
@@ -218,6 +219,30 @@ async function handleClientMessageUnlocked({
     current = await updateLead(current.leadId, { clientName: senderName });
   }
 
+  const inboundBotGuard = shouldSkipForeignBotReply({
+    lead: current,
+    incomingText: fullMessage,
+  });
+  if (inboundBotGuard.skip) {
+    await appendConversation(current.leadId, [{ role: "user", content: fullMessage }]);
+    await notifyImportantEvent(
+      current,
+      "foreign_bot_menu",
+      [
+        "Номер ответил автоменю или чужим WhatsApp-ботом.",
+        "AI не стал подыгрывать их командам и клиенту ничего не отправил.",
+        "",
+        `Текст:\n«${fullMessage.slice(0, 400)}»`,
+      ].join("\n"),
+    );
+    log("AI RESPONSE", {
+      leadId: current.leadId,
+      skippedReply: true,
+      reason: inboundBotGuard.reason,
+    });
+    return { skipped: true, reason: inboundBotGuard.reason, leadId: current.leadId };
+  }
+
   if (current.aiMode === "HUMAN" || current.aiMode === "PAUSED") {
     await appendConversation(current.leadId, [{ role: "user", content: fullMessage }]);
     await notifyImportantEvent(
@@ -315,6 +340,33 @@ async function handleClientMessageUnlocked({
       reason: "repeat",
     });
     return { skipped: true, reason: "repeat", leadId: current.leadId };
+  }
+
+  const generatedBotGuard = shouldSkipForeignBotReply({
+    lead: current,
+    incomingText: fullMessage,
+    generatedReply: reply,
+  });
+  if (generatedBotGuard.skip) {
+    if (reservedGreeting) {
+      releaseGreeting(current.leadId);
+    }
+    await appendConversation(current.leadId, [{ role: "user", content: fullMessage }]);
+    await notifyImportantEvent(
+      current,
+      "foreign_bot_menu",
+      [
+        "AI хотел ответить в логике чужого меню. Такое сообщение клиенту не отправлено.",
+        "",
+        `Текст клиента:\n«${fullMessage.slice(0, 280)}»`,
+      ].join("\n"),
+    );
+    log("AI RESPONSE", {
+      leadId: current.leadId,
+      skippedReply: true,
+      reason: generatedBotGuard.reason,
+    });
+    return { skipped: true, reason: generatedBotGuard.reason, leadId: current.leadId };
   }
 
   if (result?.parse_error || !isUsableClientReply(reply)) {
