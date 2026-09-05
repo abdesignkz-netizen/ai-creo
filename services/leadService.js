@@ -1,6 +1,7 @@
 import { normalizePhone } from "./phoneService.js";
 import { withStore, getStoreSnapshot } from "./leadStore.js";
 import { log } from "./logger.js";
+import { notifyCrm } from "./crmBridge.js";
 
 const ACTIVE_STATUSES = new Set([
   "new",
@@ -156,6 +157,9 @@ export async function getOrCreateLeadByPhone(phone, extras = {}) {
       clientPhone: normalized,
       source: lead.source,
     });
+    queueMicrotask(() =>
+      notifyCrm({ type: "lead.created", leadId, source: lead.source }),
+    );
     return lead;
   });
 }
@@ -182,6 +186,9 @@ export async function updateLead(leadId, updater) {
       status: next.status,
       aiMode: next.aiMode,
     });
+    queueMicrotask(() =>
+      notifyCrm({ type: "lead.updated", leadId, status: next.status, aiMode: next.aiMode }),
+    );
     return next;
   });
 }

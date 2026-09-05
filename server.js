@@ -22,6 +22,7 @@ import { getStorePath } from "./services/leadStore.js";
 import { logAssistantRuntimeChecks } from "./services/appConfig.js";
 import { isManagementController } from "./services/managementConfig.js";
 import { registerPendingChatBumper } from "./services/clientOutboundGate.js";
+import { createCrmInternalRouter } from "./services/crmInternalApi.js";
 
 dotenv.config();
 
@@ -215,6 +216,8 @@ function buildLeadTelegramMessage({
 
   return lines.join("\n").slice(0, 4000);
 }
+
+app.use("/internal/crm", createCrmInternalRouter());
 
 app.get("/", (_req, res) => {
   res.json({
