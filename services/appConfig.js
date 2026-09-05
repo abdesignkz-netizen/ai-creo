@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join } from "path";
 import { fileURLToPath } from "url";
 import { normalizePhone, toChatId } from "./phoneService.js";
 import { log } from "./logger.js";
+import { isManagementControlEnabled } from "./managementConfig.js";
 
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_PRESENTATION_KP_RELATIVE = "assets/private/presentation_kp.pdf";
@@ -158,6 +159,10 @@ export async function logAssistantRuntimeChecks() {
   } else {
     log("CONFIG", { presentationKp: "configured" });
   }
+
+  log("CONFIG", {
+    managementWhatsAppControl: isManagementControlEnabled() ? "enabled" : "disabled",
+  });
 
   return { manager, pdf };
 }

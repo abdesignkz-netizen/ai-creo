@@ -6,7 +6,9 @@ const STORE_PATH = getDataFile("manager-session.json");
 
 let pendingOutbound = null;
 let lastSend = null;
+let lastFocusByManager = {};
 let loaded = false;
+let skipPersist = false;
 
 async function ensureLoaded() {
   if (loaded) {
@@ -18,17 +20,22 @@ async function ensureLoaded() {
     const data = JSON.parse(raw);
     pendingOutbound = data.pendingOutbound || null;
     lastSend = data.lastSend || null;
+    lastFocusByManager = data.lastFocusByManager || {};
   } catch {
     pendingOutbound = null;
     lastSend = null;
+    lastFocusByManager = {};
   }
 }
 
 async function persist() {
+  if (skipPersist) {
+    return;
+  }
   await mkdir(dirname(STORE_PATH), { recursive: true });
   await writeFile(
     STORE_PATH,
-    JSON.stringify({ pendingOutbound, lastSend }, null, 2),
+    JSON.stringify({ pendingOutbound, lastSend, lastFocusByManager }, null, 2),
     "utf-8",
   );
 }
@@ -88,4 +95,31 @@ export async function setLastSend(payload) {
 export async function getLastSend() {
   await ensureLoaded();
   return lastSend;
+}
+
+export async function setLastFocus(payload = {}) {
+  await ensureLoaded();
+  const key = String(payload.managerPhone || "default");
+  lastFocusByManager[key] = {
+    phone: payload.phone || "",
+    leadId: payload.leadId || "",
+    name: payload.name || "",
+    updatedAt: Date.now(),
+  };
+  await persist();
+  return lastFocusByManager[key];
+}
+
+export async function getLastFocus(managerPhone) {
+  await ensureLoaded();
+  const key = String(managerPhone || "default");
+  return lastFocusByManager[key] || lastFocusByManager.default || null;
+}
+
+export function resetManagerSessionForTests() {
+  pendingOutbound = null;
+  lastSend = null;
+  lastFocusByManager = {};
+  loaded = true;
+  skipPersist = true;
 }

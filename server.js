@@ -20,6 +20,8 @@ import {
 import { log } from "./services/logger.js";
 import { getStorePath } from "./services/leadStore.js";
 import { logAssistantRuntimeChecks } from "./services/appConfig.js";
+import { isManagementController } from "./services/managementConfig.js";
+import { registerPendingChatBumper } from "./services/clientOutboundGate.js";
 
 dotenv.config();
 
@@ -61,6 +63,12 @@ app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 const pendingMessages = new Map();
 const recentIncomingIds = new Map();
+registerPendingChatBumper((chatId) => {
+  const pending = pendingMessages.get(chatId);
+  if (pending) {
+    pending.version += 1;
+  }
+});
 const MESSAGE_BUFFER_MS = Number(process.env.MESSAGE_BUFFER_MS || 2000);
 const FOLLOWUP_BUFFER_MS = Math.max(800, Math.round(MESSAGE_BUFFER_MS / 2));
 const FLUSH_TIMEOUT_MS = Number(process.env.FLUSH_TIMEOUT_MS || 90000);
@@ -433,7 +441,7 @@ async function flushPendingChat(sessionId, chatId) {
       return;
     }
 
-    if (isManagerPhone(chatId)) {
+    if (isManagerPhone(chatId) || isManagementController(chatId)) {
       await handleManagerMessage({
         message: bundle.messages.join("\n"),
         media: bundle.media,
@@ -471,7 +479,7 @@ async function flushPendingChat(sessionId, chatId) {
 
   log("AI RESPONSE", {
     chatId,
-    role: isManagerPhone(chatId) ? "MANAGER" : "CLIENT",
+    role: isManagerPhone(chatId) || isManagementController(chatId) ? "MANAGER" : "CLIENT",
     bufferMs: MESSAGE_BUFFER_MS,
     aborted,
     totalMs: Date.now() - startedAt + MESSAGE_BUFFER_MS,
@@ -483,7 +491,11 @@ async function processIncomingWebhook(body) {
   const chatId = identity.chatId;
   const senderName =
     body.senderData?.senderName || body.senderData?.chatName || "";
-  const isManager = isManagerPhone(chatId) || isManagerPhone(identity.phone);
+  const isManager =
+    isManagerPhone(chatId) ||
+    isManagerPhone(identity.phone) ||
+    isManagementController(chatId) ||
+    isManagementController(identity.phone);
   const sessionId = chatId;
 
   if (rememberIncomingId(sessionId, body.idMessage)) {

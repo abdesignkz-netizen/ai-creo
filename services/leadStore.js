@@ -3,7 +3,9 @@ import { dirname } from "path";
 import { log } from "./logger.js";
 import { getDataFile } from "./dataDir.js";
 
-const STORE_PATH = getDataFile("leads.json");
+function storePath() {
+  return getDataFile("leads.json");
+}
 
 const emptyStore = () => ({
   counter: 0,
@@ -13,6 +15,7 @@ const emptyStore = () => ({
 
 let cache = null;
 let writeChain = Promise.resolve();
+let skipPersist = false;
 
 async function readStore() {
   if (cache) {
@@ -20,7 +23,7 @@ async function readStore() {
   }
 
   try {
-    const raw = await readFile(STORE_PATH, "utf-8");
+    const raw = await readFile(storePath(), "utf-8");
     const parsed = JSON.parse(raw);
     cache = {
       counter: Number(parsed.counter) || 0,
@@ -35,11 +38,15 @@ async function readStore() {
 }
 
 async function persist(store) {
-  await mkdir(dirname(STORE_PATH), { recursive: true });
-  const tmpPath = `${STORE_PATH}.tmp`;
-  await writeFile(tmpPath, JSON.stringify(store, null, 2), "utf-8");
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), "utf-8");
   cache = store;
+  if (skipPersist) {
+    return;
+  }
+  const path = storePath();
+  await mkdir(dirname(path), { recursive: true });
+  const tmpPath = `${path}.tmp`;
+  await writeFile(tmpPath, JSON.stringify(store, null, 2), "utf-8");
+  await writeFile(path, JSON.stringify(store, null, 2), "utf-8");
 }
 
 function enqueue(task) {
@@ -65,5 +72,10 @@ export async function getStoreSnapshot() {
 }
 
 export function getStorePath() {
-  return STORE_PATH;
+  return storePath();
+}
+
+export function resetLeadStoreForTests(initial) {
+  cache = initial || emptyStore();
+  skipPersist = true;
 }

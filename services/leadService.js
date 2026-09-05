@@ -44,6 +44,15 @@ function applyLeadDefaults(lead) {
   if (lead.brief_completed === undefined) {
     lead.brief_completed = false;
   }
+  if (lead.assignedManager === undefined) {
+    lead.assignedManager = null;
+  }
+  if (lead.assignedManagerPhone === undefined) {
+    lead.assignedManagerPhone = null;
+  }
+  if (lead.lastManagementAction === undefined) {
+    lead.lastManagementAction = null;
+  }
   return lead;
 }
 
@@ -93,6 +102,9 @@ export function createEmptyLead({
     brief_completed: false,
     minPrice: null,
     goal: null,
+    assignedManager: null,
+    assignedManagerPhone: null,
+    lastManagementAction: null,
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -196,6 +208,22 @@ export async function markNotification(leadId, eventKey) {
 
 export function hasNotification(lead, eventKey) {
   return Boolean(lead?.notificationEvents?.includes(eventKey));
+}
+
+export async function popLastAssistantMessage(leadId) {
+  return updateLead(leadId, (lead) => {
+    const history = [...(lead.conversationHistory || [])];
+    const last = history[history.length - 1];
+    if (!last || last.role !== "assistant") {
+      return {};
+    }
+    history.pop();
+    const lastAi = [...history].reverse().find((item) => item.role === "assistant");
+    return {
+      conversationHistory: history,
+      lastAIMessage: lastAi?.content || "",
+    };
+  });
 }
 
 export async function appendConversation(leadId, entries) {

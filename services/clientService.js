@@ -2,6 +2,7 @@ import {
   appendConversation,
   getOrCreateLeadByPhone,
   hasNotification,
+  popLastAssistantMessage,
   updateLead,
 } from "./leadService.js";
 import { generateAiReply, detectGreeting, todayAlmatyDate } from "./aiService.js";
@@ -15,6 +16,11 @@ import {
 } from "./greetingState.js";
 import { sendWhatsAppMessage } from "./whatsappService.js";
 import { toChatId } from "./phoneService.js";
+import {
+  assertClientSendAllowed,
+  collectManagementEffects,
+  formatActiveManagementPrompt,
+} from "./managementControl.js";
 import {
   notifyClientReplied,
   notifyImportantEvent,
@@ -239,6 +245,15 @@ async function handleClientMessageUnlocked({
     appState.should_greet = false;
   }
   const actionStateInstruction = buildActionStateInstruction(current);
+  let extraInstruction = actionStateInstruction;
+  try {
+    const managementPrompt = await formatActiveManagementPrompt(current);
+    if (managementPrompt) {
+      extraInstruction = `${actionStateInstruction}\n${managementPrompt}`;
+    }
+  } catch (error) {
+    log("MANAGEMENT POLICY", { promptError: error.message, leadId: current.leadId });
+  }
   let reply;
   let result;
   let latencyMs;
@@ -247,7 +262,7 @@ async function handleClientMessageUnlocked({
       message: fullMessage,
       history,
       lead: current,
-      extraInstruction: actionStateInstruction,
+      extraInstruction,
       appState,
     }));
   } catch (error) {
@@ -270,7 +285,7 @@ async function handleClientMessageUnlocked({
       history,
       lead: current,
       extraInstruction: [
-        actionStateInstruction,
+        extraInstruction,
         `Ты уже отправил клиенту: «${lastAi}».`,
         "Не повторяй те же вопросы и формулировки.",
         "Не проси прислать файл, картинку или данные, которые уже есть в истории.",
@@ -334,11 +349,59 @@ async function handleClientMessageUnlocked({
 
   const destChatId = toChatId(current.clientPhone) || chatId;
   try {
+    const projected = { ...current, ...patch };
+    const effects = await collectManagementEffects(projected);
+    if (effects.patch) {
+      Object.assign(patch, effects.patch);
+    }
+
     current = await updateLead(current.leadId, patch);
+
+    const preSendGate = await assertClientSendAllowed(current, reply);
+    if (!preSendGate.allowed || shouldAbort?.()) {
+      if (reservedGreeting) {
+        releaseGreeting(current.leadId);
+      }
+      await appendConversation(current.leadId, [{ role: "user", content: fullMessage }]);
+      log("AI RESPONSE", {
+        leadId: current.leadId,
+        skippedReply: true,
+        reason: preSendGate.reason || "aborted",
+        blocked: !preSendGate.allowed,
+      });
+      return {
+        skipped: true,
+        blocked: !preSendGate.allowed,
+        reason: preSendGate.reason || "aborted",
+        leadId: current.leadId,
+      };
+    }
+
     current = await appendConversation(current.leadId, [
       { role: "user", content: fullMessage },
       { role: "assistant", content: reply },
     ]);
+
+    const finalGate = await assertClientSendAllowed(current, reply);
+    if (!finalGate.allowed || shouldAbort?.()) {
+      if (reservedGreeting) {
+        releaseGreeting(current.leadId);
+      }
+      await popLastAssistantMessage(current.leadId);
+      log("AI RESPONSE", {
+        leadId: current.leadId,
+        skippedReply: true,
+        reason: finalGate.reason || "aborted",
+        blocked: !finalGate.allowed,
+      });
+      return {
+        skipped: true,
+        blocked: !finalGate.allowed,
+        reason: finalGate.reason || "aborted",
+        leadId: current.leadId,
+      };
+    }
+
     await sendWhatsAppMessage(destChatId, reply);
     const greetingResult = await finalizeGreetingAfterSend({
       leadId: current.leadId,

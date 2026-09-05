@@ -33,6 +33,8 @@ import {
   setPendingOutbound,
 } from "./managerSession.js";
 import { log } from "./logger.js";
+import { handleManagementControl } from "./managementControl.js";
+import { isManagementControlEnabled } from "./managementConfig.js";
 
 const BROADCAST_DELAY_MS = Number(process.env.BROADCAST_DELAY_MS || 1200);
 const BROADCAST_MAX_RECIPIENTS = Number(process.env.BROADCAST_MAX_RECIPIENTS || 40);
@@ -800,6 +802,21 @@ export async function handleManagerMessage({ message, media = [], senderChatId }
         ].join("\n"),
       );
       return { ok: false, error: error.message };
+    }
+  }
+
+  if (isManagementControlEnabled()) {
+    try {
+      const managed = await handleManagementControl({
+        message,
+        senderChatId,
+        notify,
+      });
+      if (managed.handled) {
+        return managed.result;
+      }
+    } catch (error) {
+      log("MANAGEMENT CONTROL", { error: error.message, failSafe: true });
     }
   }
 

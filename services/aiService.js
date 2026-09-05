@@ -549,6 +549,33 @@ export async function parseManagerCommandWithAi(message) {
   return extractJsonFromText(response.output_text || "");
 }
 
+export async function parseManagementInstructionWithAi(message, context = {}) {
+  const focus = context.focus || {};
+  const input = [
+    "Разбери управляющее сообщение руководителя CREOLAB в JSON.",
+    "Это команда AI Manager, не сообщение клиенту.",
+    "Не выдумывай факты. Если не хватает суммы, имени сотрудника или клиента — needsClarification=true.",
+    "instructionType: create_rule|update_rule|cancel_rule|one_off|pause|resume|handoff|restrict|status_query|explain",
+    "scopeType: global|client|group|channel",
+    "action.kind: max_discount|handoff|pause|resume|one_off|text_rule|cancel",
+    "Для скидки укажи action.percent.",
+    "Для передачи укажи action.assignTo.",
+    "Не путай это с рассылкой или дословной отправкой клиенту.",
+    focus.phone ? `Текущий клиент в контексте: ${focus.phone} ${focus.name || ""}`.trim() : "Контекст клиента неизвестен.",
+    "",
+    `Сообщение:\n${message}`,
+    "",
+    'Ответ строго JSON: {"needsClarification": false, "clarification": "", "instructions": [{"instructionType":"","scopeType":"global","scopeId":null,"conditions":{},"action":{"kind":""},"normalizedIntent":""}]}',
+  ].join("\n");
+
+  const response = await createAiResponse({
+    input,
+    effort: "low",
+  });
+
+  return extractJsonFromText(response.output_text || "");
+}
+
 export function detectGreeting(text) {
   return /здравствуйте|добрый день|добрый вечер|доброе утро/i.test(String(text || ""));
 }
